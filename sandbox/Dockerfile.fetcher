@@ -1,0 +1,71 @@
+# syntax=docker/dockerfile:1
+#
+# mcpscan fetcher -- downloads target packages.
+#
+# This is the ONLY container in the system with network access. It is safe only
+# because it never executes what it downloads, and there are exactly two ways
+# that rule gets broken by accident. Both are closed here, in the image, because
+# no `docker run` flag can close them:
+#
+#   * `npm install` runs preinstall/install/postinstall scripts -- arbitrary
+#     code execution during what looks like a download. Fetching uses
+#     `npm pack`, which retrieves the tarball without running lifecycle
+#     scripts, and NPM_CONFIG_IGNORE_SCRIPTS=true is the belt to that braces.
+#
+#   * `pip download` builds source distributions, and building an sdist
+#     executes its setup.py. Fetching uses --only-binary=:all: so a
+#     wheel-less package is refused rather than built.
+#
+# Do NOT add a step that runs, imports, builds, or unpacks-and-invokes a fetched
+# package. If you need to inspect package contents, do it in the runner.
+
+FROM ghcr.io/astral-sh/uv@sha256:2d890623d310b57771ce840f0da5eed5fc6d657da05ffaa45d82797b53fa3abc AS uv
+
+# Same base as the runner: one digest to audit and bump, and the fetched
+# artifact is guaranteed to have been resolved against the same libc and Node
+# version that will later run it.
+FROM node:24-bookworm-slim@sha256:3638d9a6fe4030bd716be989438248074489337ba3275657f93595428be4fc03
+
+# ca-certificates matters here and only here -- this is the one image that
+# makes TLS connections. python3-pip is needed for `pip download`; the runner
+# deliberately does not have it.
+RUN apt-get update \
+ && apt-get install --yes --no-install-recommends \
+        ca-certificates python3 python3-pip \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY --from=uv /uv /uvx /usr/local/bin/
+
+RUN printf 'fetcher\n' > /etc/mcpscan-sandbox \
+ && chmod 0444 /etc/mcpscan-sandbox
+
+RUN useradd --uid 65532 --user-group --home-dir /tmp --no-create-home \
+            --shell /usr/sbin/nologin scan
+
+# /out is the one writable mount in the whole system: fetched artifacts land
+# there. Created here so it exists with the right owner under --read-only.
+RUN mkdir -p /out && chown 65532:65532 /out
+
+ENV HOME=/tmp \
+    TMPDIR=/tmp \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_INPUT=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_ROOT_USER_ACTION=ignore \
+    NPM_CONFIG_CACHE=/tmp/.npm \
+    NPM_CONFIG_IGNORE_SCRIPTS=true \
+    NPM_CONFIG_AUDIT=false \
+    NPM_CONFIG_FUND=false \
+    NPM_CONFIG_UPDATE_NOTIFIER=false \
+    UV_CACHE_DIR=/tmp/.uv \
+    UV_NO_MODIFY_PATH=1
+
+WORKDIR /out
+USER 65532:65532
+
+# Clear the node base image's docker-entrypoint.sh, for the same reason as the
+# runner: the fetch command is constructed by mcpscan, not baked into the image.
+ENTRYPOINT []
+
+HEALTHCHECK NONE

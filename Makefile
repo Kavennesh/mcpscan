@@ -1,4 +1,4 @@
-.PHONY: install images lint test check clean
+.PHONY: install images lint test sandbox-test check clean
 
 install:
 	uv sync
@@ -12,7 +12,10 @@ lint:
 	uv run mypy src/
 
 test:
-	uv run pytest -q
+	uv run pytest -q -m 'not sandbox'
+
+sandbox-test:
+	uv run pytest -q -m sandbox -v
 
 check: lint test
 

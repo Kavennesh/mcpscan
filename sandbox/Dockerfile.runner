@@ -1,0 +1,76 @@
+# syntax=docker/dockerfile:1
+#
+# mcpscan runner -- executes untrusted MCP servers.
+#
+# Nothing in this image is trusted at runtime. The confinement that matters is
+# applied by the flags SandboxHandle.build_argv() passes to `docker run`, not
+# by anything here; this image only has to
+#
+#   (a) carry the runtimes a target might need,
+#   (b) never run as root, and
+#   (c) carry /etc/mcpscan-sandbox, which is what stops the escape fixtures
+#       from executing outside a container.
+#
+# Do NOT add a network-capable fetching tool here. Downloading is
+# Dockerfile.fetcher's job, and the separation between "fetches" and "executes"
+# is the whole reason the fetcher is allowed to have network at all.
+
+# Pinned by digest so `make images` is reproducible: a security tool's sandbox
+# should not change shape because an upstream tag moved. Resolved 2026-08-13;
+# bump deliberately.
+FROM ghcr.io/astral-sh/uv@sha256:2d890623d310b57771ce840f0da5eed5fc6d657da05ffaa45d82797b53fa3abc AS uv
+
+# Debian bookworm gives python3.11 (the project floor) and glibc. Alpine/musl
+# breaks native npm modules and a good number of Python wheels, which a scanner
+# would misreport as "the target server is broken".
+FROM node:24-bookworm-slim@sha256:3638d9a6fe4030bd716be989438248074489337ba3275657f93595428be4fc03
+
+# targets.py accepts npx/npm/pnpm/node and python/python3/uv/uvx, so both
+# runtimes have to be present. Node and npm come from the base image.
+RUN apt-get update \
+ && apt-get install --yes --no-install-recommends python3 \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY --from=uv /uv /uvx /usr/local/bin/
+
+# The escape fixtures refuse to run unless they can see this file. Running
+# tests/fixtures/escapes/escape_forkbomb.py by hand on a laptop is then a
+# no-op instead of a fork bomb.
+RUN printf 'runner\n' > /etc/mcpscan-sandbox \
+ && chmod 0444 /etc/mcpscan-sandbox
+
+# 65532 is the distroless "nonroot" convention. Baked in as the image default
+# so the container is still non-root even if --user is ever dropped from the
+# run flags.
+RUN useradd --uid 65532 --user-group --home-dir /tmp --no-create-home \
+            --shell /usr/sbin/nologin scan
+
+# HOME must be writable and the root filesystem is mounted read-only at run
+# time, so point HOME and every cache at the tmpfs the runner flags provide.
+ENV HOME=/tmp \
+    TMPDIR=/tmp \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    NODE_ENV=production \
+    NPM_CONFIG_CACHE=/tmp/.npm \
+    NPM_CONFIG_IGNORE_SCRIPTS=true \
+    NPM_CONFIG_AUDIT=false \
+    NPM_CONFIG_FUND=false \
+    NPM_CONFIG_UPDATE_NOTIFIER=false \
+    UV_CACHE_DIR=/tmp/.uv \
+    UV_NO_MODIFY_PATH=1
+
+WORKDIR /target
+USER 65532:65532
+
+# Clear the ENTRYPOINT inherited from the node base image, which is
+# docker-entrypoint.sh. Two reasons: argv must come from
+# SandboxHandle.build_argv() so a target cannot be smuggled in through an
+# image-level default, and a shell wrapper in the exec path is one more thing
+# between the run flags and the process they are meant to confine.
+ENTRYPOINT []
+
+# No STOPSIGNAL override. The default SIGTERM is exactly what
+# escape_hang.py ignores, and overriding it to SIGKILL here would quietly
+# defeat that fixture by making the timeout path succeed for the wrong reason.
+HEALTHCHECK NONE
