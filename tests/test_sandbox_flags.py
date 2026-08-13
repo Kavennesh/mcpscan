@@ -209,3 +209,19 @@ def test_network_is_enabled_only_when_limits_ask_for_it() -> None:
     flags, _ = split(argv, str(sandbox.Image.FETCHER))
     assert options(flags)["--network"] != ["none"]
     assert "--network host" not in " ".join(argv)
+
+
+def test_network_is_refused_for_the_runner_image() -> None:
+    """The negative half of fetch/execute separation.
+
+    The test above proves the fetcher *can* be networked. This proves nothing
+    else can. Without it, `Limits(network=True)` reaches build_argv for any
+    image and silently produces `--network bridge` around untrusted code --
+    which is the exact configuration the whole sandbox exists to prevent, and
+    it would be a one-word change to fall into.
+
+    build_argv is the single chokepoint: run() constructs its argv here, so
+    refusing at this level closes the path rather than one caller of it.
+    """
+    with pytest.raises(sandbox.SandboxError, match="fetcher"):
+        build(image=sandbox.Image.RUNNER, limits=sandbox.Limits(network=True))

@@ -7,8 +7,13 @@ point of the tool rather than merely weaken it. If another module needs to run
 something, it goes through :class:`SandboxHandle`;
 ``tests/test_containment.py`` enforces that across the whole repository.
 
-Three properties are worth stating explicitly, because each one is load-bearing
+Four properties are worth stating explicitly, because each one is load-bearing
 and none of them is obvious from reading the flag list:
+
+**Only the fetcher may have network.** ``Limits.network`` is refused for any
+other image. The fetcher is safe with egress solely because it never executes
+what it downloads; the same flag on the runner is a networked untrusted target,
+which is the one configuration this tool exists to prevent.
 
 **Output is drained, never merely capped.** Once ``Limits.stdout_bytes`` is
 reached the excess is read and discarded rather than left in the pipe. Stopping
@@ -80,7 +85,7 @@ _INSPECT_FORMAT: Final = '{{.Id}} {{.Created}} {{index .Config.Labels "mcpscan.s
 
 
 class SandboxError(RuntimeError):
-    """The sandbox itself misbehaved.
+    """The sandbox itself misbehaved, or was asked for a configuration it refuses.
 
     Never raised because a *target* misbehaved -- a target that floods, hangs or
     crashes is a normal :class:`SandboxResult`, not an exception.
@@ -403,7 +408,20 @@ class SandboxHandle:
             ``/var/lib/docker`` on the host, whatever our own read cap says.
         ``--pids-limit``
             Counts threads, not just processes, on cgroup v2.
+
+        Raises :class:`SandboxError` if ``limits.network`` is set for anything
+        but the fetcher. Refusing here rather than at the call site makes this
+        the single chokepoint: :meth:`run` builds its argv through this method,
+        so there is no path to a networked runner.
         """
+        if limits.network and image is not Image.FETCHER:
+            raise SandboxError(
+                f"network=True is only valid for {Image.FETCHER}, not {image}. "
+                "The fetcher may have egress because it never executes what it "
+                "downloads; the same flag on a runner is a networked untrusted "
+                "target."
+            )
+
         argv = [
             DOCKER,
             "run",
