@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "deny": [
+      "Bash(rm -rf*)",
+      "Bash(docker run*--privileged*)",
+      "Bash(docker run*-v /:*)",
+      "Bash(docker run*--network host*)",
+      "Edit(.github/workflows/**)"
+    ],
+    "ask": [
+      "Edit(src/mcpscan/sandbox.py)",
+      "Edit(sandbox/**)"
+    ]
+  }
+}
