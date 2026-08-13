@@ -20,13 +20,27 @@ class TargetError(Exception):
     pass
 
 
+_RUNNERS = {"npx", "uvx", "uv", "pnpm", "npm", "bunx", "node", "python", "python3", "deno"}
+
+
+def _derive_label(argv: list[str]) -> str:
+    """Best-effort package name: first non-flag token after a known runner."""
+    for token in argv[1:] if argv[0] in _RUNNERS else argv:
+        if token.startswith("-"):
+            continue
+        if token in {"run", "exec", "x", "tool"}:
+            continue
+        return token
+    return argv[0]
+
+
 def from_stdio(command: str, label: str | None = None) -> Target:
     argv = shlex.split(command)
     if not argv:
         raise TargetError("empty stdio command")
     return Target(
         kind=TargetKind.STDIO,
-        label=label or argv[-1],
+        label=label or _derive_label(argv),
         command=argv,
         origin="cli:--stdio",
     )

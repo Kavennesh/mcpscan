@@ -1,2 +1,1 @@
-def main() -> None:
-    print("Hello from mcpscan!")
+__version__ = "0.1.0"

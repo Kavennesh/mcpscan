@@ -19,13 +19,34 @@ app = typer.Typer(
 
 @app.command()
 def scan(
-    stdio: Annotated[str | None, typer.Option(help="Command to launch, e.g. 'npx -y @vendor/server'")] = None,
-    url: Annotated[str | None, typer.Option(help="Streamable HTTP endpoint")] = None,
-    path: Annotated[Path | None, typer.Option(help="Local source tree")] = None,
-    config: Annotated[Path | None, typer.Option(help="MCP client config to import")] = None,
-    static_only: Annotated[bool, typer.Option(help="Skip all dynamic probing")] = False,
-    fail_on: Annotated[Severity, typer.Option(help="Exit 1 at or above this severity")] = Severity.HIGH,
-    yes_i_am_authorised: Annotated[bool, typer.Option("--yes-i-am-authorised", help="Skip the consent prompt (CI)")] = False,
+    stdio: Annotated[
+        str | None,
+        typer.Option(help="Command to launch, e.g. 'npx -y @vendor/server'"),
+    ] = None,
+    url: Annotated[
+        str | None,
+        typer.Option(help="Streamable HTTP endpoint"),
+    ] = None,
+    path: Annotated[
+        Path | None,
+        typer.Option(help="Local source tree"),
+    ] = None,
+    config: Annotated[
+        Path | None,
+        typer.Option(help="MCP client config to import"),
+    ] = None,
+    static_only: Annotated[
+        bool,
+        typer.Option(help="Skip all dynamic probing"),
+    ] = False,
+    fail_on: Annotated[
+        Severity,
+        typer.Option(help="Exit 1 at or above this severity"),
+    ] = Severity.HIGH,
+    yes_i_am_authorised: Annotated[
+        bool,
+        typer.Option("--yes-i-am-authorised", help="Skip the consent prompt (CI)"),
+    ] = False,
 ) -> None:
     """Scan one or more MCP servers."""
     selected = [bool(stdio), bool(url), bool(path), bool(config)]
@@ -42,10 +63,12 @@ def scan(
         elif path:
             resolved = [tgt.from_path(path)]
         else:
-            resolved = tgt.from_client_config(config)  # type: ignore[arg-type]
+            if config is None:  # unreachable; satisfies the type checker
+                raise typer.Exit(EXIT_ERROR)
+            resolved = tgt.from_client_config(config)
     except tgt.TargetError as exc:
         typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(EXIT_ERROR)
+        raise typer.Exit(EXIT_ERROR) from exc
 
     if not resolved:
         typer.echo("error: no targets resolved", err=True)

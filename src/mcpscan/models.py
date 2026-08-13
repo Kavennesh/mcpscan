@@ -1,18 +1,18 @@
 from __future__ import annotations
 
-from enum import Enum
+from enum import StrEnum
 from pathlib import Path
 
 from pydantic import BaseModel, Field, model_validator
 
 
-class TargetKind(str, Enum):
+class TargetKind(StrEnum):
     STDIO = "stdio"   # local process, launched via docker
     HTTP = "http"     # remote streamable-http endpoint
     PATH = "path"     # local source tree, static analysis only
 
 
-class Severity(str, Enum):
+class Severity(StrEnum):
     CRITICAL = "critical"
     HIGH = "high"
     MEDIUM = "medium"
@@ -24,7 +24,7 @@ class Severity(str, Enum):
         return {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}[self.value]
 
 
-class Confidence(str, Enum):
+class Confidence(StrEnum):
     HIGH = "high"
     MEDIUM = "medium"
     LOW = "low"
@@ -35,7 +35,7 @@ class Confidence(str, Enum):
 
 
 class Target(BaseModel):
-    """A thing to be scanned. Never holds secret values — only env var names."""
+    """A thing to be scanned. Never holds secret values -- only env var names."""
 
     kind: TargetKind
     label: str
@@ -46,7 +46,7 @@ class Target(BaseModel):
     origin: str = "cli"
 
     @model_validator(mode="after")
-    def _check_shape(self) -> "Target":
+    def _check_shape(self) -> Target:
         required = {
             TargetKind.STDIO: "command",
             TargetKind.HTTP: "url",
