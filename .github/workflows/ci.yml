@@ -21,4 +21,23 @@ jobs:
       - run: uv sync --all-extras --dev
       - run: uv run ruff check src/ tests/
       - run: uv run mypy src/
-      - run: uv run pytest -q
+      - run: uv run pytest -q -m 'not sandbox'
+
+  sandbox:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv python install 3.12
+      - run: uv sync --all-extras --dev
+      - name: Build sandbox images
+        run: make images
+      - name: Escape and transport suites
+        run: uv run pytest -q -m sandbox
+      - name: No containers leaked
+        run: |
+          leaked=$(docker ps -a --filter label=mcpscan.session --format '{{.Names}}')
+          test -z "$leaked" || { echo "leaked: $leaked"; exit 1; }
