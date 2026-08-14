@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated
@@ -8,11 +9,15 @@ import typer
 
 from mcpscan import __version__, report
 from mcpscan import targets as tgt
-from mcpscan.analyser import AnalysisResult, Subject, analyse, default_rules
+from mcpscan.analyser import AnalysisResult, default_rules
 from mcpscan.consent import ensure_consent
 from mcpscan.engine import RuleError
+from mcpscan.lockfile import Lock, LockError
 from mcpscan.models import Severity, Target, TargetKind
+from mcpscan.prober import ProbeBudget
 from mcpscan.ruleloader import lint_all, load_all
+from mcpscan.sandbox import SandboxHandle
+from mcpscan.scanrun import ScanOptions, lock_path_for, run_scan, run_verify
 
 EXIT_OK, EXIT_FINDINGS, EXIT_ERROR = 0, 1, 2
 
@@ -94,6 +99,18 @@ def scan(
         Path | None,
         typer.Option("--rules", help="Directory of additional YAML rules"),
     ] = None,
+    deep: Annotated[
+        bool,
+        typer.Option("--deep", help="Probe harder: more conditions, more payloads, longer"),
+    ] = False,
+    write_lock: Annotated[
+        bool,
+        typer.Option("--write-lock", help="Record per-tool hashes to .mcpscan.lock"),
+    ] = False,
+    lock: Annotated[
+        Path | None,
+        typer.Option("--lock", help="Lock file path (default .mcpscan.lock)"),
+    ] = None,
     yes_i_am_authorised: Annotated[
         bool,
         typer.Option("--yes-i-am-authorised", help="Skip the consent prompt (CI)"),
@@ -134,49 +151,71 @@ def scan(
     for t in resolved:
         typer.echo("  " + t.describe().replace("\n", "\n  "), err=True)
 
-    dynamic = [t for t in resolved if t.kind is not TargetKind.PATH]
-    if dynamic:
-        # The transport and client exist (step 3), but nothing yet drives them
-        # through a scan. Naming the missing piece beats a stale message about
-        # the sandbox, which has been built for two steps.
-        typer.echo(
-            f"\nnot implemented: {len(dynamic)} target(s) need dynamic probing, "
-            "which is not wired up yet.",
-            err=True,
-        )
-        typer.echo("only --path targets can be scanned today.", err=True)
-        raise typer.Exit(EXIT_ERROR)
-
     try:
         ruleset = default_rules(rules)
     except RuleError as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(EXIT_ERROR) from exc
 
-    collected: list[tuple[Target, AnalysisResult]] = []
-    worst = EXIT_OK
-    for target in resolved:
-        if target.path is None:  # unreachable; satisfies the type checker
-            continue
+    if any(t.kind is TargetKind.STDIO for t in resolved) and not SandboxHandle.available():
+        # Refuse rather than fall back. There is no path that runs a target
+        # outside Docker, and a scan that silently skipped the live half would
+        # report "clean" for a server it never contacted.
+        typer.echo(
+            "error: no reachable Docker daemon, and a stdio target can only be "
+            "probed inside the sandbox. Start Docker, or use --path.",
+            err=True,
+        )
+        raise typer.Exit(EXIT_ERROR)
+
+    options = ScanOptions(
+        rules=ruleset,
+        budget=ProbeBudget.deep() if deep else ProbeBudget(),
+        static_only=static_only,
+    )
+    # One event loop for the whole scan, not one per target: sandbox.py holds a
+    # module-level asyncio.Lock for container reaping, and handing it a second
+    # loop is a bug waiting for a Python version that stops tolerating it.
+    run = asyncio.run(run_scan(resolved, options))
+
+    for problem in run.errors:
+        typer.echo(f"error: {problem}", err=True)
+    for note in run.notes:
+        typer.echo(f"warning: {note}", err=True)
+
+    if write_lock and static_only:
+        # Pinning a server you did not check for drift is the one combination
+        # that quietly defeats the point: `verify` then goes green forever
+        # against a baseline nothing ever probed.
+        typer.echo(
+            "warning: --write-lock with --static-only records a surface that "
+            "MCP-007 never checked. Drop --static-only to pin a probed server.",
+            err=True,
+        )
+
+    if write_lock and run.locks:
+        destination = lock_path_for(lock)
         try:
-            result = analyse(Subject.from_path(target.path, label=target.label), ruleset)
+            Lock(servers=run.locks).write(destination)
         except OSError as exc:
-            typer.echo(f"error: could not scan {target.label}: {exc}", err=True)
+            typer.echo(f"error: could not write {destination}: {exc}", err=True)
             raise typer.Exit(EXIT_ERROR) from exc
-        collected.append((target, result))
-        if result.at_or_above(fail_on):
-            worst = EXIT_FINDINGS
+        typer.echo(f"wrote {destination} ({len(run.locks)} server(s))", err=True)
 
     rendered = (
-        report.render(collected, fail_on=fail_on)
+        report.render(run.results, fail_on=fail_on)
         if format is ReportFormat.JSON
-        else _text(collected, fail_on)
+        else _text(run.results, fail_on)
     )
     if output is not None:
         output.write_text(rendered, encoding="utf-8")
     else:
         typer.echo(rendered, nl=False)
 
+    if run.errors:
+        # A target that could not be scanned is a scanner error, never a finding.
+        raise typer.Exit(EXIT_ERROR)
+    worst = EXIT_FINDINGS if any(r.at_or_above(fail_on) for _, r in run.results) else EXIT_OK
     raise typer.Exit(worst)
 
 
@@ -221,6 +260,78 @@ def _text(results: list[tuple[Target, AnalysisResult]], fail_on: Severity) -> st
                 f"{len(actionable)} at or above {fail_on.value}"
             )
     return "\n".join(lines) + "\n"
+
+
+@app.command()
+def verify(
+    lock: Annotated[
+        Path | None,
+        typer.Option("--lock", help="Lock file path (default .mcpscan.lock)"),
+    ] = None,
+    target: Annotated[
+        str | None,
+        typer.Option("--target", help="Verify only this server from the lock"),
+    ] = None,
+    format: Annotated[
+        ReportFormat,
+        typer.Option("--format", help="Output format"),
+    ] = ReportFormat.TEXT,
+    yes_i_am_authorised: Annotated[
+        bool,
+        typer.Option("--yes-i-am-authorised", help="Skip the consent prompt (CI)"),
+    ] = False,
+) -> None:
+    """Check locked servers still serve what they served when the lock was written.
+
+    Exit 0 unchanged, 1 drift, 2 error -- the same contract as `scan`. This is the
+    piece meant to run on every build: a dependency whose tool descriptions change
+    between two builds is the supply-chain half of the rug-pull problem, and a
+    hash comparison catches it in seconds.
+    """
+    path = lock_path_for(lock)
+    try:
+        loaded = Lock.read(path)
+    except LockError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(EXIT_ERROR) from exc
+
+    if target is not None:
+        if target not in loaded.servers:
+            typer.echo(
+                f"error: {target!r} is not in {path}. It holds: "
+                f"{', '.join(sorted(loaded.servers)) or '(nothing)'}",
+                err=True,
+            )
+            raise typer.Exit(EXIT_ERROR)
+        loaded = Lock(servers={target: loaded.servers[target]})
+
+    if not loaded.servers:
+        typer.echo(f"error: {path} locks no servers; nothing to verify", err=True)
+        raise typer.Exit(EXIT_ERROR)
+
+    ensure_consent(assume_yes=yes_i_am_authorised)
+
+    if not SandboxHandle.available():
+        typer.echo(
+            "error: no reachable Docker daemon, and verifying means launching the "
+            "server in the sandbox. Drift is unknown, which is not the same as none.",
+            err=True,
+        )
+        raise typer.Exit(EXIT_ERROR)
+
+    typer.echo(f"verifying {len(loaded.servers)} server(s) against {path}", err=True)
+    result = asyncio.run(run_verify(loaded, {}, budget=ProbeBudget()))
+
+    if format is ReportFormat.JSON:
+        import json
+
+        typer.echo(json.dumps(result.to_json(), indent=2) + "\n", nl=False)
+    else:
+        typer.echo(result.render(), nl=False)
+
+    if result.errors:
+        raise typer.Exit(EXIT_ERROR)
+    raise typer.Exit(EXIT_FINDINGS if result.drifts else EXIT_OK)
 
 
 @rules_app.command("list")

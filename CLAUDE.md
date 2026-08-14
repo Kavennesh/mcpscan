@@ -65,21 +65,40 @@ All three must pass before any commit. mypy runs in strict mode; do not add
 - `src/mcpscan/report.py` -- JSON, `schema_version: 1`. The only clock outside
   `sandbox.py`. Stdout carries the report and nothing else.
 - `src/mcpscan/analyser.py` -- runs the rules and reports what it could not run.
+- `src/mcpscan/canary.py` -- planted secrets. Decoy files mounted read-only at
+  `/home/canary`, env values generated per scan from `Target.env_keys`. Detection
+  is exact substring match on a token made seconds earlier, which is why MCP-008
+  and MCP-009 report HIGH confidence with no benign corpus behind them.
+- `src/mcpscan/prober.py` -- drives a live server. `Connector` opens sessions;
+  `ProbeBudget` allowances are **per probe, never a shared pool** -- one pool lets
+  the rug pull drain it before the other probes run.
+- `src/mcpscan/probes.py` -- MCP-007/008/009. Concealment raises confidence: a
+  silent mutation outranks an announced one.
+- `src/mcpscan/fetch.py` -- fetcher downloads with network, runner executes
+  offline from a read-only mount. Nothing installs in the runner's 64 MB tmpfs.
+- `src/mcpscan/lockfile.py` -- `.mcpscan.lock` and drift. Absence is never success.
+- `src/mcpscan/scanrun.py` -- the async half of a scan. **One `asyncio.run` per
+  scan, never one per target**: `sandbox.py` holds a module-level `asyncio.Lock`.
 - `docs/rules/<ID>.md` -- one page per rule, by convention. CI checks both
   directions, so neither a rule nor a page can be added without the other.
 
 ## Build order -- do not skip ahead
 
-`mcpscan scan --path` now runs end to end and exits 0/1. `--stdio` and `--url`
-still exit 2: the transport and client exist, but nothing drives them through a
-scan until step 6. `tests/test_cli.py::test_stdio_targets_are_refused_until_probing_exists`
-is the successor to the old `test_scan_refuses_without_sandbox` and keeps that
-refusal honest. Do not "fix" it either.
+`--path` and `--stdio` both run end to end, including registry specs:
+`npx -y @modelcontextprotocol/server-filesystem /tmp` scans in about 20 seconds.
+`--url` still exits 2 -- the Streamable HTTP bridge is the one piece not built --
+and `test_cli.py::test_url_targets_are_refused_with_an_accurate_reason` keeps that
+refusal honest. It is the last descendant of `test_scan_refuses_without_sandbox`;
+narrow it when the bridge lands rather than deleting it.
 
-`ProtocolAnomaly` now maps to `Finding` in `anomalies.py`, but the CLI cannot yet
-*produce* those findings: nothing drives the client through a scan until step 6.
-The mapping is exercised by `test_anomaly_mapping.py` and by the Docker-gated
-client suite, which provokes fourteen of the fifteen reportable kinds.
+**Two measurements decided the fetch design, and are worth not re-deriving.**
+`npm pack` retrieves one tarball and no dependencies, so an offline install of it
+fails with `ENOTCACHED`. And a typical server's tree is 31 MB, which peaks the
+runner's 64 MB tmpfs at 93% if you install it there. Hence: resolve into a host
+directory in the fetcher, mount it read-only, install nothing in the runner.
+`fetch.py` uses `npm install --ignore-scripts`, which departs from the letter of
+`Dockerfile.fetcher` ("fetching uses npm pack") while keeping its stated reason;
+that is a deliberate call, documented in the module, and worth re-reviewing.
 
 **Precision is not negotiable in the rules.** `tests/test_negative_controls.py`
 holds the fixtures that must report *zero*: `server_clean.py`'s metadata, ~50
@@ -92,15 +111,22 @@ get skimmed is worse than no scanner.
 
 **Adding a rule** means a YAML file in `src/mcpscan/rules/`, positive *and*
 negative cases inside it, a `remediation`, and `docs/rules/<ID>.md`. All four are
-enforced; the negative cases are enforced by the schema itself.
+enforced; the negative cases are enforced by the schema itself. Rules that are not
+pattern rules (MCP-003, MCP-004/005/006, MCP-007/008/009) live in code but still
+owe a docs page -- `test_rule_files.py` checks both directions across all four
+homes.
+
+**Probing calls the target's tools with hostile arguments.** That is only
+reasonable because the container has no network, a read-only root, no
+capabilities and a hard wall clock. There is no flag to probe outside it.
 
 1. [x] CLI and target loader
 2. [x] Sandbox + escape test suite
 3. [x] stdio transport, MCP client
 4. [x] Static analyser, 3 rules
 5. [x] YAML rule engine, JSON report
-6. [ ] Dynamic prober, rug pull detection   <- current
-7. [ ] SARIF output
+6. [x] Dynamic prober, rug pull detection   (--url bridge outstanding)
+7. [ ] SARIF output   <- current
 8. [ ] HTML report
 
 ## Style

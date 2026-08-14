@@ -250,8 +250,17 @@ def tool_fingerprint(tools: list[dict[str, Any]]) -> dict[str, str]:
 class MCPClient:
     """Drives one MCP conversation over a :class:`~mcpscan.transport.StdioTransport`."""
 
-    def __init__(self, transport: StdioTransport) -> None:
+    def __init__(self, transport: StdioTransport, *, client_name: str | None = None) -> None:
+        """``client_name`` overrides only the ``clientInfo.name`` we present.
+
+        A server that serves one tool list to `mcpscan` and another to
+        `claude-ai` is doing the thing the rug-pull probe exists to find, and it
+        cannot be observed without presenting more than one identity. Nothing
+        else about the handshake varies: :data:`CLIENT_CAPABILITIES` stays empty,
+        so any server-to-client request is still unambiguously unnegotiated.
+        """
         self._transport = transport
+        self.client_name = client_name or CLIENT_NAME
         self.anomalies: AnomalyLog = transport.anomalies
         self.profile: ServerProfile | None = None
 
@@ -267,7 +276,7 @@ class MCPClient:
             "protocolVersion": PROTOCOL_VERSION,
             "capabilities": dict(CLIENT_CAPABILITIES),
             "clientInfo": {
-                "name": CLIENT_NAME,
+                "name": self.client_name,
                 "title": "mcpscan security scanner",
                 "version": CLIENT_VERSION,
             },

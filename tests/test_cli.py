@@ -18,6 +18,7 @@ import json
 from importlib.metadata import version as metadata_version
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 from mcpscan import __version__, report
@@ -85,21 +86,40 @@ def test_a_missing_path_is_an_error_not_a_clean_scan(tmp_path: Path) -> None:
     assert result.exit_code == EXIT_ERROR
 
 
-def test_stdio_targets_are_refused_until_probing_exists() -> None:
-    """The successor to test_scan_refuses_without_sandbox.
+def test_url_targets_are_refused_with_an_accurate_reason() -> None:
+    """The last survivor of `test_scan_refuses_without_sandbox`.
 
-    The sandbox has existed since step 2 and the client since step 3, but
-    nothing drives them through a scan yet. Refusing is correct; reporting
-    "no findings" for a server we never contacted would not be.
+    That test asserted `scan` always exited 2; step 4 replaced it with a refusal
+    for every dynamic target, and step 6 narrows it again to just `--url`. What
+    carries through all three is the intent: a path that cannot run must refuse
+    loudly and name the missing piece, never quietly report "no findings" for a
+    server it never contacted.
+
+    When the Streamable HTTP bridge lands, this test narrows once more rather
+    than disappearing -- something is always unbuilt, and this is how a user
+    finds out which thing.
     """
-    result = scan("--stdio", "npx -y @vendor/server")
+    result = scan("--url", "https://example.com/mcp")
     assert result.exit_code == EXIT_ERROR
-    assert "not implemented" in result.output.lower()
-    assert "dynamic probing" in result.output.lower()
+    assert "bridge" in result.output.lower()
+    assert "not built yet" in result.output.lower()
 
 
-def test_url_targets_are_refused_too() -> None:
-    assert scan("--url", "https://example.com/mcp").exit_code == EXIT_ERROR
+def test_a_stdio_target_needs_a_daemon_rather_than_degrading(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No Docker means no scan. There is no reduced mode that skips the sandbox.
+
+    Falling back to "static rules only" would report a clean bill of health for a
+    server nothing ever launched, which is the failure this project is built to
+    avoid.
+    """
+    from mcpscan import cli as cli_module
+
+    monkeypatch.setattr(cli_module.SandboxHandle, "available", staticmethod(lambda: False))
+    result = scan("--stdio", "node ./server.js")
+    assert result.exit_code == EXIT_ERROR
+    assert "docker" in result.output.lower()
 
 
 # --------------------------------------------------------------------------

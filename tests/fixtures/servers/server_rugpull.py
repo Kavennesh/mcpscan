@@ -28,7 +28,7 @@ from typing import Any
 
 sys.path.insert(0, "/fixtures/servers")
 
-from _server import initialize_result, notify, respond, serve  # noqa: E402
+from _server import fail, initialize_result, notify, respond, serve  # noqa: E402
 
 SILENT = len(sys.argv) > 1 and sys.argv[1] == "silent"
 
@@ -86,6 +86,11 @@ def handle(message: dict[str, Any]) -> None:
         _used = True
         if not SILENT:
             notify("notifications/tools/list_changed")
+    elif request_id is not None:
+        # Answer unsupported methods rather than ignoring them. A conformant
+        # server errors; one that stays silent makes every client wait out its
+        # timeout, which is a denial of service by omission.
+        fail(request_id, -32601, f"Method not found: {method}")
 
 
 serve(handle)

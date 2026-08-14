@@ -24,6 +24,7 @@ from mcpscan.anomalies import rule_metas
 from mcpscan.document import FieldKind, TextField
 from mcpscan.engine import DOCS_BASE_URL, LoadedRule, RuleError, RuleMeta, ScanState
 from mcpscan.models import Finding
+from mcpscan.probes import rule_metas as probe_rule_metas
 from mcpscan.ruleloader import load_builtin, load_text
 from mcpscan.taint import UnsanitisedSinkRule
 from tests.fixtures.descriptions.benign import BENIGN_DESCRIPTIONS
@@ -213,8 +214,18 @@ def test_the_corpora_are_actually_reaching_the_rules() -> None:
 # documentation
 # --------------------------------------------------------------------------
 def all_rule_metas() -> list[RuleMeta]:
-    """Every rule that can appear in a finding: YAML rules, MCP-003, the anomalies."""
-    return [item.rule.meta for item in BUNDLED] + [TAINT_META] + rule_metas()
+    """Every rule that can appear in a finding.
+
+    Four homes by now: YAML rules, MCP-003 in `taint.py`, the protocol anomalies
+    in `anomalies.py`, and the dynamic probes in `probes.py`. The docs check is
+    what stops a rule being added in any of them without a page.
+    """
+    return (
+        [item.rule.meta for item in BUNDLED]
+        + [TAINT_META]
+        + rule_metas()
+        + probe_rule_metas()
+    )
 
 
 def all_rule_ids() -> set[str]:
