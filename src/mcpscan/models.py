@@ -227,9 +227,9 @@ class Finding(BaseModel):
     #: that cannot say what to do about its finding is not finished, and a report
     #: full of "we detected a thing" is one nobody acts on. SARIF `help.text`.
     remediation: str = ""
-    #: Where the rule is documented, by convention `docs/rules/<ID>.md` plus an
-    #: optional `#anchor`. A path in data is a path that rots; a convention can
-    #: be checked in both directions. SARIF `helpUri`.
+    #: Absolute URL of the rule's documentation, plus an optional `#anchor`.
+    #: Absolute rather than repo-relative because a finding outlives the checkout
+    #: it came from, and because SARIF `helpUri` requires a real URI.
     help_uri: str = ""
     metadata: dict[str, Any] = Field(default_factory=dict)
 

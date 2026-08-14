@@ -80,6 +80,13 @@ class RuleError(Exception):
     """A rule could not be loaded. Ours or a contributor's, never a target's."""
 
 
+#: Where the rule documentation is published. A finding travels further than the
+#: checkout it came from -- into a JSON report, a CI annotation, a SARIF upload --
+#: and a repo-relative path points at nothing for anyone who installed a wheel.
+#: SARIF's `helpUri` requires an absolute URI regardless, which step 7 depends on.
+DOCS_BASE_URL: Final = "https://github.com/Kavennesh/mcpscan/blob/main/docs/rules"
+
+
 @dataclass(frozen=True, slots=True)
 class RuleMeta:
     id: str
@@ -88,9 +95,19 @@ class RuleMeta:
     remediation: str
 
     @property
+    def doc_filename(self) -> str:
+        """The page in ``docs/rules/``. What CI checks the existence of."""
+        return f"{self.id}.md"
+
+    @property
     def help_uri(self) -> str:
-        """Where the rule is documented. By convention, so it cannot rot."""
-        return f"docs/rules/{self.id}.md"
+        """Where the rule is documented, as a URL a reader can actually open.
+
+        Derived from the id by convention rather than written into each rule
+        file: a path stored as data is a path that rots the first time a file
+        moves, and a convention can be checked in both directions by CI.
+        """
+        return f"{DOCS_BASE_URL}/{self.doc_filename}"
 
 
 @dataclass(frozen=True, slots=True)

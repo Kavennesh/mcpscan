@@ -290,8 +290,15 @@ async def test_a_second_response_cannot_overwrite_the_first() -> None:
 
     async with connect("server_dup_ids.py") as (_, transport, client):
         await client.initialize()
+        # Catches the unsolicited response the server volunteers after initialize.
         await transport.settle()
         tools = await client.list_tools()
+        # And this one catches the duplicate. `list_tools` returns the instant
+        # the *first* response resolves its future, so without a settle here the
+        # block exits and aclose() cancels the reader while the overwrite is
+        # still in flight -- the assertion below then fails intermittently, on
+        # scheduling rather than on behaviour.
+        await transport.settle()
 
     # The benign list is what we acted on; the overwrite was recorded, not applied.
     assert len(tools) == 1

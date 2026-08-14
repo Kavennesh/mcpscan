@@ -28,6 +28,7 @@ from mcpscan.anomalies import (
     to_findings,
     unmapped_kinds,
 )
+from mcpscan.engine import DOCS_BASE_URL
 from mcpscan.models import AnomalyKind, Confidence, ProtocolAnomaly, Severity
 
 
@@ -179,7 +180,9 @@ def test_every_finding_carries_remediation_and_a_help_anchor() -> None:
         findings, _ = to_findings([anomaly(kind)])
         finding = findings[0]
         assert len(finding.remediation) > 30
-        assert finding.help_uri == f"docs/rules/{mapping.rule.id}.md#{kind.value.replace('_', '-')}"
+        anchor = kind.value.replace("_", "-")
+        assert finding.help_uri == f"{DOCS_BASE_URL}/{mapping.rule.id}.md#{anchor}"
+        assert finding.help_uri.startswith("https://")
 
 
 def test_the_subject_is_carried_through() -> None:
@@ -205,7 +208,8 @@ def test_the_three_rules_are_distinct_and_documented() -> None:
     assert [m.id for m in metas] == ["MCP-004", "MCP-005", "MCP-006"]
     for meta in metas:
         assert len(meta.remediation) > 30
-        assert meta.help_uri == f"docs/rules/{meta.id}.md"
+        assert meta.help_uri == f"{DOCS_BASE_URL}/{meta.id}.md"
+        assert meta.doc_filename == f"{meta.id}.md"
 
 
 def test_an_empty_log_produces_nothing() -> None:

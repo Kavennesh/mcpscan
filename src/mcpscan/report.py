@@ -29,6 +29,7 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any, Final
 
+from mcpscan import __version__
 from mcpscan.analyser import AnalysisResult
 from mcpscan.models import Finding, Location, Severity, Target
 
@@ -37,7 +38,9 @@ from mcpscan.models import Finding, Location, Severity, Target
 SCHEMA_VERSION: Final = 1
 
 TOOL_NAME: Final = "mcpscan"
-TOOL_VERSION: Final = "0.1.0"
+#: From installed metadata, not a literal. A report that names the wrong release
+#: is a report nobody can correlate with a build.
+TOOL_VERSION: Final = __version__
 
 # ---------------------------------------------------------------------------
 # SARIF mapping, for step 7. Written down here so it is derived from the shape

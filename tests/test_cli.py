@@ -15,10 +15,12 @@ cannot run must refuse loudly rather than quietly reporting nothing.
 from __future__ import annotations
 
 import json
+from importlib.metadata import version as metadata_version
 from pathlib import Path
 
 from typer.testing import CliRunner
 
+from mcpscan import __version__, report
 from mcpscan.cli import EXIT_ERROR, EXIT_FINDINGS, EXIT_OK, app
 from tests.sourcefixtures import materialise
 
@@ -27,6 +29,43 @@ runner = CliRunner()
 
 def scan(*args: str) -> object:
     return runner.invoke(app, ["scan", *args, "--yes-i-am-authorised"])
+
+
+# --------------------------------------------------------------------------
+# --version
+# --------------------------------------------------------------------------
+def test_version_flag_prints_the_version_and_exits_zero() -> None:
+    """Found by installing the wheel into a clean venv: the option did not exist.
+
+    Nothing in the suite invoked the app without a subcommand, so `mcpscan
+    --version` failing with "No such option" was invisible until someone tried
+    the first thing anyone tries.
+    """
+    result = runner.invoke(app, ["--version"])
+    assert result.exit_code == EXIT_OK
+    assert result.stdout.strip() == __version__
+
+
+def test_the_version_comes_from_installed_metadata() -> None:
+    """One source of truth. It was previously a literal in three places."""
+    assert __version__ == metadata_version("mcpscan")
+    assert report.TOOL_VERSION == __version__
+
+
+def test_version_is_eager_and_needs_no_target() -> None:
+    """Checking which build you have should not require supplying a target."""
+    result = runner.invoke(app, ["--version"])
+    assert result.exit_code == EXIT_OK
+    assert "target" not in result.stdout.lower()
+
+
+def test_the_json_report_names_the_installed_version(tmp_path: Path) -> None:
+    root = materialise(tmp_path, "clean_server")
+    result = CliRunner().invoke(
+        app,
+        ["scan", "--path", str(root), "--format", "json", "--yes-i-am-authorised"],
+    )
+    assert json.loads(result.stdout)["tool"]["version"] == __version__
 
 
 # --------------------------------------------------------------------------

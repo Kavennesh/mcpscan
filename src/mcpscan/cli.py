@@ -6,7 +6,7 @@ from typing import Annotated
 
 import typer
 
-from mcpscan import report
+from mcpscan import __version__, report
 from mcpscan import targets as tgt
 from mcpscan.analyser import AnalysisResult, Subject, analyse, default_rules
 from mcpscan.consent import ensure_consent
@@ -29,6 +29,31 @@ app = typer.Typer(
 
 rules_app = typer.Typer(help="Inspect and check the rule pack.")
 app.add_typer(rules_app, name="rules")
+
+
+def _show_version(value: bool) -> None:
+    if value:
+        typer.echo(__version__)
+        raise typer.Exit(EXIT_OK)
+
+
+@app.callback()
+def main_options(
+    version: Annotated[
+        bool,
+        typer.Option(
+            "--version",
+            callback=_show_version,
+            is_eager=True,
+            help="Show the installed version and exit.",
+        ),
+    ] = False,
+) -> None:
+    """Security scanner for Model Context Protocol servers.
+
+    ``--version`` is eager so it answers before argument validation: someone
+    checking which build they have should not first have to supply a target.
+    """
 
 
 @app.command()

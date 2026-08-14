@@ -22,9 +22,10 @@ import pytest
 
 from mcpscan.anomalies import rule_metas
 from mcpscan.document import FieldKind, TextField
-from mcpscan.engine import LoadedRule, RuleError, ScanState
+from mcpscan.engine import DOCS_BASE_URL, LoadedRule, RuleError, RuleMeta, ScanState
 from mcpscan.models import Finding
 from mcpscan.ruleloader import load_builtin, load_text
+from mcpscan.taint import UnsanitisedSinkRule
 from tests.fixtures.descriptions.benign import BENIGN_DESCRIPTIONS
 from tests.fixtures.descriptions.benign_unicode import BENIGN_UNICODE
 from tests.fixtures.servers import clean_metadata
@@ -34,6 +35,9 @@ DOCS = Path(__file__).parent.parent / "docs" / "rules"
 
 BUNDLED = load_builtin()
 BUNDLED_IDS = [item.rule.meta.id for item in BUNDLED]
+
+#: MCP-003 is code, not YAML, but it still owes a page and a help URL.
+TAINT_META = UnsanitisedSinkRule.meta
 
 
 def ids(items: list[LoadedRule]) -> list[str]:
@@ -208,13 +212,25 @@ def test_the_corpora_are_actually_reaching_the_rules() -> None:
 # --------------------------------------------------------------------------
 # documentation
 # --------------------------------------------------------------------------
+def all_rule_metas() -> list[RuleMeta]:
+    """Every rule that can appear in a finding: YAML rules, MCP-003, the anomalies."""
+    return [item.rule.meta for item in BUNDLED] + [TAINT_META] + rule_metas()
+
+
 def all_rule_ids() -> set[str]:
-    """Every id that can appear in a finding: YAML rules, MCP-003, the anomalies."""
-    return set(BUNDLED_IDS) | {"MCP-003"} | {meta.id for meta in rule_metas()}
+    return {meta.id for meta in all_rule_metas()}
 
 
 def test_every_rule_has_a_documentation_page() -> None:
-    missing = sorted(rid for rid in all_rule_ids() if not (DOCS / f"{rid}.md").is_file())
+    """Checked against the file on disk, never against the URL.
+
+    `help_uri` is a github.com link now, and a test that fetched it would be
+    asserting that a network is reachable rather than that a page was written.
+    The file is the artefact; the URL is where it ends up.
+    """
+    missing = sorted(
+        meta.id for meta in all_rule_metas() if not (DOCS / meta.doc_filename).is_file()
+    )
     assert not missing, f"no docs/rules page for: {missing}"
 
 
@@ -231,9 +247,30 @@ def test_every_rule_has_remediation(loaded: LoadedRule) -> None:
     assert len(loaded.rule.meta.remediation) > 30
 
 
-def test_help_uri_points_at_the_page() -> None:
-    for loaded in BUNDLED:
-        assert loaded.rule.meta.help_uri == f"docs/rules/{loaded.rule.meta.id}.md"
+def test_help_uri_is_an_absolute_url() -> None:
+    """A repo-relative path points at nothing for anyone who installed a wheel.
+
+    SARIF's `helpUri` needs a real URI at step 7 regardless, so this is not
+    merely cosmetic.
+    """
+    for meta in all_rule_metas():
+        assert meta.help_uri.startswith("https://")
+        assert meta.help_uri == f"{DOCS_BASE_URL}/{meta.id}.md"
+
+
+def test_the_help_url_and_the_checked_file_cannot_drift() -> None:
+    """The URL's last segment must be the file the check above looked for.
+
+    Without this the two could diverge silently: the page test would keep passing
+    against `docs/rules/MCP-001.md` while every published link pointed elsewhere.
+    """
+    for meta in all_rule_metas():
+        assert meta.help_uri.rsplit("/", 1)[-1] == meta.doc_filename
+        assert (DOCS / meta.doc_filename).is_file()
+
+
+def test_the_docs_base_url_names_this_repository() -> None:
+    assert DOCS_BASE_URL == "https://github.com/Kavennesh/mcpscan/blob/main/docs/rules"
 
 
 def test_anomaly_help_anchors_exist_in_their_pages() -> None:
