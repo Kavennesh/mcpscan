@@ -1,0 +1,77 @@
+# MCP-003's negative control: an MCP server that takes caller-supplied
+# parameters and uses them safely. Zero findings expected.
+#
+# Stored as .py.txt on purpose. tests/test_containment.py globs **/*.py across
+# src/ and tests/ to enforce CLAUDE.md constraint 2, and this file names the very
+# functions that constraint is about. As data it is invisible to that scan; the
+# test materialises it into tmp_path as a real .py so the analyser still walks a
+# genuine Python tree.
+#
+# Every tool here is a shape the rule must NOT report:
+#   - sanitised before reaching a shell
+#   - looked up through an allowlist rather than interpolated
+#   - a constant path, however tainted the rest of the function is
+#   - a fixed command whose arguments never come from the caller
+
+from __future__ import annotations
+
+import shlex
+import subprocess
+
+from mcp.server.fastmcp import FastMCP
+
+mcp = FastMCP("clean")
+
+ALLOWED_REPORTS = {
+    "daily": "/srv/reports/daily.csv",
+    "weekly": "/srv/reports/weekly.csv",
+}
+
+CONFIG_PATH = "/etc/mcpscan-demo/config.toml"
+
+
+@mcp.tool()
+def grep_logs(pattern: str) -> str:
+    """Searches the application log for a pattern."""
+    # Quoted before it reaches a shell, which is what "unsanitised" excludes.
+    quoted = shlex.quote(pattern)
+    return subprocess.check_output(f"grep {quoted} /var/log/app.log", shell=True, text=True)
+
+
+@mcp.tool()
+def run_report(name: str) -> str:
+    """Reads a pre-generated report by name."""
+    # The parameter selects a path; it never becomes one.
+    path = ALLOWED_REPORTS.get(name)
+    if path is None:
+        raise ValueError(f"unknown report: {name}")
+    with open(path, encoding="utf-8") as handle:
+        return handle.read()
+
+
+@mcp.tool()
+def read_config(section: str) -> str:
+    """Returns one section of the server configuration."""
+    # Tainted parameter in the function, but the path is a constant.
+    with open(CONFIG_PATH, encoding="utf-8") as handle:
+        text = handle.read()
+    return "\n".join(line for line in text.splitlines() if line.startswith(section))
+
+
+@mcp.tool()
+def disk_usage() -> str:
+    """Reports free space on the data volume."""
+    # A fixed command with no caller input anywhere in it.
+    return subprocess.check_output(["df", "-h", "/data"], text=True)
+
+
+@mcp.tool()
+def count_lines(path: str) -> int:
+    """Counts the lines in a file under the data directory."""
+    # Rebinding from a clean expression: `path` is tainted on entry, but the
+    # value that reaches open() is built from a constant and a basename.
+    import os.path
+
+    safe = "/data/" + os.path.basename(path)
+    with open(safe, encoding="utf-8") as handle:
+        return sum(1 for _ in handle)

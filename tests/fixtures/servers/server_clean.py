@@ -8,6 +8,11 @@ its findings ignored.
 It also exercises the paths that only appear on a *correct* server -- two-page
 cursor pagination, an `isError: true` tool result, resource templates -- so the
 happy path is proven rather than assumed.
+
+Step 4 reuses it as the negative control for the static rules: all three must
+find nothing here. The metadata lives in ``clean_metadata.py`` so a pure test can
+read it without running this module, which blocks on stdin the moment it is
+imported.
 """
 
 from __future__ import annotations
@@ -18,52 +23,14 @@ from typing import Any
 sys.path.insert(0, "/fixtures/servers")
 
 from _server import fail, initialize_result, respond, serve  # noqa: E402
-
-TOOLS_PAGE_ONE = [
-    {
-        "name": "read_file",
-        "title": "Read a file",
-        "description": "Returns the contents of a file.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {"path": {"type": "string"}},
-            "required": ["path"],
-        },
-        "annotations": {"readOnlyHint": True},
-    },
-    {
-        "name": "write_file",
-        "description": "Writes a file.",
-        "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}},
-        "annotations": {"readOnlyHint": False, "destructiveHint": True},
-    },
-]
-
-TOOLS_PAGE_TWO = [
-    {
-        "name": "list_dir",
-        "description": "Lists a directory.",
-        "inputSchema": {"type": "object", "additionalProperties": False},
-    }
-]
-
-RESOURCES = [
-    {
-        "uri": "file:///project/README.md",
-        "name": "README.md",
-        "title": "Project documentation",
-        "mimeType": "text/markdown",
-        "size": 42,
-    }
-]
-
-PROMPTS = [
-    {
-        "name": "code_review",
-        "description": "Asks for a code review.",
-        "arguments": [{"name": "code", "description": "The code", "required": True}],
-    }
-]
+from clean_metadata import (  # noqa: E402
+    INSTRUCTIONS,
+    PROMPTS,
+    RESOURCE_TEMPLATES,
+    RESOURCES,
+    TOOLS_PAGE_ONE,
+    TOOLS_PAGE_TWO,
+)
 
 
 def handle(message: dict[str, Any]) -> None:
@@ -80,7 +47,7 @@ def handle(message: dict[str, Any]) -> None:
                     "resources": {"subscribe": False, "listChanged": False},
                     "prompts": {"listChanged": False},
                 },
-                instructions="Use read_file before write_file.",
+                instructions=INSTRUCTIONS,
             ),
         )
     elif method == "notifications/initialized":
@@ -108,14 +75,7 @@ def handle(message: dict[str, Any]) -> None:
     elif method == "resources/list":
         respond(request_id, {"resources": RESOURCES})
     elif method == "resources/templates/list":
-        respond(
-            request_id,
-            {
-                "resourceTemplates": [
-                    {"uriTemplate": "file:///{path}", "name": "Project files"}
-                ]
-            },
-        )
+        respond(request_id, {"resourceTemplates": RESOURCE_TEMPLATES})
     elif method == "resources/read":
         respond(
             request_id,

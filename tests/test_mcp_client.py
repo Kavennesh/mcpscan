@@ -107,6 +107,42 @@ async def test_a_clean_server_produces_no_anomalies() -> None:
     assert transport.anomalies.items == (), [a.kind for a in transport.anomalies]
 
 
+async def test_the_live_server_serves_exactly_what_clean_metadata_declares() -> None:
+    """The drift guard for step 4's negative control.
+
+    ``test_negative_controls.py`` asserts that all three static rules find
+    nothing in ``clean_metadata`` -- and that test runs in CI, where there is no
+    container. This one runs only where there is, and proves the pure test is
+    checking what the real server actually serves rather than a copy that
+    drifted. Without it, the control could silently stop describing the fixture.
+    """
+    from mcpscan.document import MetadataDocument
+    from tests.fixtures.servers import clean_metadata
+
+    async with connect("server_clean.py") as (_, _transport, client):
+        survey = await client.survey()
+
+    served = MetadataDocument.from_survey(survey)
+
+    assert served.instructions == clean_metadata.INSTRUCTIONS
+    assert served.tools == clean_metadata.TOOLS
+    assert served.resources == clean_metadata.RESOURCES
+    assert served.resource_templates == clean_metadata.RESOURCE_TEMPLATES
+    assert served.prompts == clean_metadata.PROMPTS
+
+
+async def test_the_live_clean_server_produces_no_static_findings() -> None:
+    """Belt and braces: the rules run against a genuinely served document."""
+    from mcpscan.analyser import Subject, analyse
+    from mcpscan.document import MetadataDocument
+
+    async with connect("server_clean.py") as (_, _transport, client):
+        survey = await client.survey()
+
+    result = analyse(Subject(label="clean", document=MetadataDocument.from_survey(survey)))
+    assert result.findings == [], [f.message for f in result.findings]
+
+
 async def test_pagination_walks_every_page() -> None:
     """Three tools across two pages: the cursor loop is walked, not short-circuited."""
     async with connect("server_clean.py") as (_, transport, client):

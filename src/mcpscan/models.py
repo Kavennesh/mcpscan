@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 from pathlib import Path
-from typing import Final
+from typing import Any, Final
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -131,3 +131,115 @@ class ProtocolAnomaly(BaseModel):
         if value is None:
             return None
         return value[:RAW_SAMPLE_BYTES]
+
+
+#: Same argument as RAW_SAMPLE_BYTES, one layer up: a finding quotes a target's
+#: text back, and the target does not get to decide how long our report is.
+EVIDENCE_CHARS: Final = 240
+
+
+class Span(BaseModel):
+    """Offsets into one field's text, in characters *and* UTF-8 bytes.
+
+    Both, because they answer different questions and neither can be cheaply
+    recovered from the other at report time. Character offsets slice the excerpt;
+    byte offsets are what MCP-001 reports, what a user greps for, and what SARIF
+    wants in step 7. Converting in the reporter would mean re-encoding the string
+    there -- and the string is attacker-controlled, so the conversion belongs
+    where the text is already in hand.
+    """
+
+    start: int
+    end: int
+    byte_start: int
+    byte_end: int
+
+    @classmethod
+    def of(cls, text: str, start: int, end: int) -> Span:
+        """Build a span from character offsets, deriving the byte offsets."""
+        return cls(
+            start=start,
+            end=end,
+            byte_start=len(text[:start].encode("utf-8")),
+            byte_end=len(text[:end].encode("utf-8")),
+        )
+
+    def excerpt(self, text: str) -> str:
+        return text[self.start : self.end]
+
+
+class Location(BaseModel):
+    """Where a finding is, in whichever coordinate systems are available.
+
+    A scan can see a target three ways, and the location has to survive all
+    three: a source tree gives a file and line range, a live server gives a JSON
+    pointer into the metadata it served, and a target that is both gives both.
+    Neither half is a fallback for the other -- ``#/tools/3/description`` is the
+    only way to name a field on a server whose source we do not have, and a line
+    number is the only thing a developer can act on.
+    """
+
+    path: Path | None = None
+    start_line: int | None = None
+    end_line: int | None = None
+    pointer: str | None = None
+    span: Span | None = None
+
+    @model_validator(mode="after")
+    def _locates_something(self) -> Location:
+        if self.path is None and self.pointer is None:
+            raise ValueError("a Location needs at least one of 'path' or 'pointer'")
+        return self
+
+    def describe(self) -> str:
+        parts: list[str] = []
+        if self.path is not None:
+            where = str(self.path)
+            if self.start_line is not None:
+                where += f":{self.start_line}"
+                if self.end_line is not None and self.end_line != self.start_line:
+                    where += f"-{self.end_line}"
+            parts.append(where)
+        if self.pointer is not None:
+            pointer = self.pointer
+            if self.span is not None:
+                pointer += f" [{self.span.byte_start}:{self.span.byte_end}]"
+            parts.append(pointer)
+        return "  ".join(parts)
+
+
+class Finding(BaseModel):
+    """One thing a rule decided is wrong. The shape every report serialises from."""
+
+    rule_id: str
+    title: str
+    severity: Severity
+    confidence: Confidence
+    message: str
+    location: Location
+    #: Corroborating positions. MCP-003 findings are inherently two-place -- the
+    #: sink is where the bug is, the tainted parameter is why it is one -- and
+    #: SARIF has `relatedLocations` for exactly this, so step 7 stays mechanical.
+    related: list[Location] = Field(default_factory=list)
+    evidence: str | None = None
+    subject: str = ""
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("evidence")
+    @classmethod
+    def _truncate(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if len(value) <= EVIDENCE_CHARS:
+            return value
+        return value[:EVIDENCE_CHARS] + "..."
+
+    @property
+    def sort_key(self) -> tuple[int, int, str, str]:
+        """Worst first, then most certain first, then stable."""
+        return (
+            -self.severity.rank,
+            -self.confidence.rank,
+            self.rule_id,
+            self.location.describe(),
+        )

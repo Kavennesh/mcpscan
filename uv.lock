@@ -338,6 +338,7 @@ dev = [
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "ruff" },
+    { name = "types-regex" },
 ]
 
 [package.metadata]
@@ -355,6 +356,7 @@ dev = [
     { name = "pytest", specifier = ">=9.1.1" },
     { name = "pytest-asyncio", specifier = ">=1.4.0" },
     { name = "ruff", specifier = ">=0.16.3" },
+    { name = "types-regex", specifier = ">=2024.11.6" },
 ]
 
 [[package]]
@@ -828,6 +830,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/ae/40/4a3db7990d1f62a53182aa96eaef57aeb2886a27f90a195bc66713565d31/typer-0.27.1.tar.gz", hash = "sha256:a79bef8469a79c45498e7b814ecf8d603cc7644e9acbd9e19cac0334240b18df", size = 203994, upload-time = "2026-08-03T14:41:03.438Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/43/89/9518bc0c3929bee36b3a4a8e3daddd6e03f92f9961c66d4983b837160543/typer-0.27.1-py3-none-any.whl", hash = "sha256:53150287edd11baeb4e4722c8e394fcdf8181c0ae89485cba8d25c778d5edd56", size = 122874, upload-time = "2026-08-03T14:41:04.391Z" },
+]
+
+[[package]]
+name = "types-regex"
+version = "2026.7.19.20260720"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/00/bc/825471e08455b037c40d2c80fe9f93a574fcfef0b2e6c6fc2e248ada4adb/types_regex-2026.7.19.20260720.tar.gz", hash = "sha256:49ab8261bd46fa215245b9cb0d2fed1c1056fbdc763303714f6132208909afcf", size = 13473, upload-time = "2026-07-20T05:27:00.203Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b0/1a/9bbd3eace00c2562556570d2464afe843ef5f8118df17aee5f36fed5948f/types_regex-2026.7.19.20260720-py3-none-any.whl", hash = "sha256:70e76f05d8ef60f00227e50351f1cb81552d1cdf3fdf77350f7063c911ee26da", size = 11147, upload-time = "2026-07-20T05:26:59.245Z" },
 ]
 
 [[package]]

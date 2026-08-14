@@ -1,0 +1,73 @@
+# MCP-003's positive fixtures: tool parameters reaching dangerous calls.
+#
+# Stored as .py.txt for the reason given in clean_server.py.txt -- as a real .py
+# this file would trip tests/test_containment.py, which is exactly the guard it
+# should not be allowed to weaken.
+#
+# Each tool below is one propagation shape the rule has to follow.
+
+from __future__ import annotations
+
+import os
+import subprocess
+
+from mcp.server.fastmcp import FastMCP
+
+mcp = FastMCP("vulnerable")
+
+
+@mcp.tool()
+def ping(host: str) -> str:
+    """Pings a host."""
+    # Direct: parameter straight into a shell.
+    return subprocess.check_output(f"ping -c 1 {host}", shell=True, text=True)
+
+
+@mcp.tool()
+def find_files(pattern: str) -> str:
+    """Finds files matching a pattern."""
+    # One hop through a local, built with an f-string.
+    command = f"find /data -name {pattern}"
+    return os.system(command)
+
+
+@mcp.tool()
+def archive(name: str, destination: str) -> str:
+    """Archives a directory."""
+    # Multi-hop: parameter -> concat -> list -> sink, no shell.
+    source = "/data/" + name
+    argv = ["tar", "-czf", destination, source]
+    return subprocess.check_output(argv, text=True)
+
+
+@mcp.tool()
+def evaluate(expression: str) -> str:
+    """Evaluates an arithmetic expression."""
+    # Code execution, the other sink family.
+    return str(eval(expression))
+
+
+@mcp.tool()
+def fetch_document(path: str) -> str:
+    """Reads a document by path."""
+    # Non-constant path: reported, at lower confidence, because a tool that
+    # opens a caller-supplied path is often doing its job.
+    with open(path, encoding="utf-8") as handle:
+        return handle.read()
+
+
+@mcp.tool()
+def render(template: str, values: dict) -> str:
+    """Renders a template."""
+    # Taint through .format() and through a dict.
+    body = template.format(**values)
+    return subprocess.check_output(["sh", "-c", body], text=True)
+
+
+@mcp.tool()
+def cleanup(target: str) -> str:
+    """Removes a temporary directory."""
+    # Taint survives a rebind from another tainted expression.
+    path = target
+    path = path.strip()
+    return subprocess.check_output("rm -rf " + path, shell=True, text=True)

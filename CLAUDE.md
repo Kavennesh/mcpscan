@@ -41,24 +41,42 @@ All three must pass before any commit. mypy runs in strict mode; do not add
 - `src/mcpscan/transport.py` -- stdio transport. Takes a `SandboxSession` and
   nothing else; there is no path to a channel the sandbox did not create.
 - `src/mcpscan/client.py` -- MCP client, revision 2025-11-25.
+- `src/mcpscan/document.py` -- one metadata shape for both a live survey and a
+  source tree, plus `walk_text`, the traversal every metadata rule runs on.
+  JSON pointers are RFC 6901 in fragment form: `#/tools/3/description`.
+- `src/mcpscan/source.py` -- `ast` extraction of tool definitions. Per-field line
+  ranges point at the *string literal*, not the `def`. Paths are relative to the
+  scan root.
+- `src/mcpscan/rules.py` -- MCP-001 and MCP-002 on a shared `PatternRule` base.
+  That base is the shape step 5's YAML schema should generate.
+- `src/mcpscan/taint.py` -- MCP-003. Sinks are named as **strings** so constraint
+  2 holds; there is no import and no attribute access here.
+- `src/mcpscan/analyser.py` -- runs the rules and reports what it could not run.
 
 ## Build order -- do not skip ahead
 
-Analysis code does not get written until the sandbox passes its escape tests.
-It does now, and steps 2 and 3 are done -- but `cli.py` is still unwired, and
-`tests/test_cli.py::test_scan_refuses_without_sandbox` still asserts that
-`scan` exits 2. That test is intentional. Do not "fix" it; it comes out when
-step 4 gives the CLI something to report.
+`mcpscan scan --path` now runs end to end and exits 0/1. `--stdio` and `--url`
+still exit 2: the transport and client exist, but nothing drives them through a
+scan until step 6. `tests/test_cli.py::test_stdio_targets_are_refused_until_probing_exists`
+is the successor to the old `test_scan_refuses_without_sandbox` and keeps that
+refusal honest. Do not "fix" it either.
 
 Step 3 records what a target did wrong as `ProtocolAnomaly`, not `Finding`.
-Mapping anomalies to findings is step 4/5 work, once the rule engine and the
-report formats exist to constrain the shape.
+Mapping anomalies to findings is still open, and step 5 is where it belongs.
+
+**Precision is not negotiable in the rules.** `tests/test_negative_controls.py`
+holds the fixtures that must report *zero*: `server_clean.py`'s metadata, ~50
+realistic benign descriptions, legitimate Unicode (emoji ZWJ sequences, Persian
+ZWNJ, Hebrew RLM, a leading BOM), and a safe source tree. Each is paired with an
+injection test proving the control is not vacuous. A rule change that needs one
+of those fixtures relaxed is the wrong change -- a scanner whose findings get
+skimmed is worse than no scanner.
 
 1. [x] CLI and target loader
 2. [x] Sandbox + escape test suite
 3. [x] stdio transport, MCP client
-4. [ ] Static analyser, 3 rules   <- current
-5. [ ] YAML rule engine, JSON report
+4. [x] Static analyser, 3 rules
+5. [ ] YAML rule engine, JSON report   <- current
 6. [ ] Dynamic prober, rug pull detection
 7. [ ] SARIF output
 8. [ ] HTML report

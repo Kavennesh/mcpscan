@@ -41,6 +41,9 @@ dev = [
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
     "ruff>=0.16.3",
+    # Stubs only. `regex` itself is already a runtime dependency; without these
+    # mypy --strict cannot see through it and MCP-001's patterns go unchecked.
+    "types-regex>=2024.11.6",
 ]
 
 [tool.pytest.ini_options]

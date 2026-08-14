@@ -6,8 +6,9 @@ from typing import Annotated
 import typer
 
 from mcpscan import targets as tgt
+from mcpscan.analyser import AnalysisResult, Subject, analyse
 from mcpscan.consent import ensure_consent
-from mcpscan.models import Severity, Target
+from mcpscan.models import Severity, Target, TargetKind
 
 EXIT_OK, EXIT_FINDINGS, EXIT_ERROR = 0, 1, 2
 
@@ -80,9 +81,69 @@ def scan(
     for t in resolved:
         typer.echo("  " + t.describe().replace("\n", "\n  "))
 
-    typer.echo("\nnot implemented: the sandbox is not built yet.", err=True)
-    typer.echo("no analysis will run until sandbox escape tests pass.", err=True)
-    raise typer.Exit(EXIT_ERROR)
+    dynamic = [t for t in resolved if t.kind is not TargetKind.PATH]
+    if dynamic:
+        # The transport and client exist (step 3), but nothing yet drives them
+        # through a scan. Naming the missing piece beats a stale message about
+        # the sandbox, which has been built for two steps.
+        typer.echo(
+            f"\nnot implemented: {len(dynamic)} target(s) need dynamic probing, "
+            "which is not wired up yet.",
+            err=True,
+        )
+        typer.echo("only --path targets can be scanned today.", err=True)
+        raise typer.Exit(EXIT_ERROR)
+
+    worst = EXIT_OK
+    for target in resolved:
+        if target.path is None:  # unreachable; satisfies the type checker
+            continue
+        try:
+            result = analyse(Subject.from_path(target.path, label=target.label))
+        except OSError as exc:
+            typer.echo(f"error: could not scan {target.label}: {exc}", err=True)
+            raise typer.Exit(EXIT_ERROR) from exc
+        if _report(target.label, result, fail_on) is EXIT_FINDINGS:
+            worst = EXIT_FINDINGS
+
+    raise typer.Exit(worst)
+
+
+def _report(label: str, result: AnalysisResult, fail_on: Severity) -> int:
+    """Print one target's result. Deliberately minimal -- JSON is step 5."""
+    typer.echo(f"\n{label}: {result.files_scanned} file(s) scanned")
+
+    for finding in result.findings:
+        typer.echo("")
+        typer.echo(
+            f"  {finding.severity.value.upper():8} {finding.rule_id}  "
+            f"({finding.confidence.value} confidence)"
+        )
+        typer.echo(f"    {finding.message}")
+        typer.echo(f"    at {finding.location.describe()}")
+        for related in finding.related:
+            typer.echo(f"    from {related.describe()}")
+        if finding.evidence:
+            typer.echo(f"    | {finding.evidence}")
+
+    # Printed whether or not anything was found. "No findings" and "no analysis"
+    # look identical in a report that lists only findings, and a user who trusts
+    # a clean result for a scan that never ran is worse off than one who ran
+    # nothing at all.
+    for rule_id, why in result.skipped:
+        typer.echo(f"\n  note: {rule_id} did not run -- {why}")
+    for path, why in result.unparsed:
+        typer.echo(f"  note: {path} was not analysed -- {why}")
+
+    actionable = result.at_or_above(fail_on)
+    if not result.findings:
+        typer.echo("\n  no findings")
+    else:
+        typer.echo(
+            f"\n  {len(result.findings)} finding(s), "
+            f"{len(actionable)} at or above {fail_on.value}"
+        )
+    return EXIT_FINDINGS if actionable else EXIT_OK
 
 
 @app.command()
