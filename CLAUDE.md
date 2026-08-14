@@ -47,11 +47,26 @@ All three must pass before any commit. mypy runs in strict mode; do not add
 - `src/mcpscan/source.py` -- `ast` extraction of tool definitions. Per-field line
   ranges point at the *string literal*, not the `def`. Paths are relative to the
   scan root.
-- `src/mcpscan/rules.py` -- MCP-001 and MCP-002 on a shared `PatternRule` base.
-  That base is the shape step 5's YAML schema should generate.
-- `src/mcpscan/taint.py` -- MCP-003. Sinks are named as **strings** so constraint
-  2 holds; there is no import and no attribute access here.
+- `src/mcpscan/engine.py` -- the pattern-rule engine. `PatternRule`, the three
+  closed hook registries, and the per-match regex timeout. **Never widen
+  `except TimeoutError` to `except OSError`** -- `TimeoutError` is a subclass of
+  it, so the broad clause silently disables the backtracking defence.
+- `src/mcpscan/predicates.py` -- the only hooks YAML may name. Adding one is a
+  reviewed code change; a rule file can reference but never define behaviour.
+- `src/mcpscan/ruleloader.py` -- YAML schema (pydantic, `extra="forbid"`,
+  `safe_load` only). `tests.negative` is required by the schema, which is where
+  "a rule PR without a negative case fails the build" actually lives.
+- `src/mcpscan/rules/*.yaml` -- the bundled pack. MCP-001 and MCP-002.
+- `src/mcpscan/taint.py` -- MCP-003, in code. Taint analysis is not pattern
+  matching; do not push it into YAML. Sinks are named as **strings** so
+  constraint 2 holds; no import and no attribute access here.
+- `src/mcpscan/anomalies.py` -- `AnomalyKind` -> `Finding`. Fifteen kinds map to
+  MCP-004/005/006; four are coverage notes, never findings.
+- `src/mcpscan/report.py` -- JSON, `schema_version: 1`. The only clock outside
+  `sandbox.py`. Stdout carries the report and nothing else.
 - `src/mcpscan/analyser.py` -- runs the rules and reports what it could not run.
+- `docs/rules/<ID>.md` -- one page per rule, by convention. CI checks both
+  directions, so neither a rule nor a page can be added without the other.
 
 ## Build order -- do not skip ahead
 
@@ -61,23 +76,30 @@ scan until step 6. `tests/test_cli.py::test_stdio_targets_are_refused_until_prob
 is the successor to the old `test_scan_refuses_without_sandbox` and keeps that
 refusal honest. Do not "fix" it either.
 
-Step 3 records what a target did wrong as `ProtocolAnomaly`, not `Finding`.
-Mapping anomalies to findings is still open, and step 5 is where it belongs.
+`ProtocolAnomaly` now maps to `Finding` in `anomalies.py`, but the CLI cannot yet
+*produce* those findings: nothing drives the client through a scan until step 6.
+The mapping is exercised by `test_anomaly_mapping.py` and by the Docker-gated
+client suite, which provokes fourteen of the fifteen reportable kinds.
 
 **Precision is not negotiable in the rules.** `tests/test_negative_controls.py`
 holds the fixtures that must report *zero*: `server_clean.py`'s metadata, ~50
 realistic benign descriptions, legitimate Unicode (emoji ZWJ sequences, Persian
 ZWNJ, Hebrew RLM, a leading BOM), and a safe source tree. Each is paired with an
-injection test proving the control is not vacuous. A rule change that needs one
-of those fixtures relaxed is the wrong change -- a scanner whose findings get
-skimmed is worse than no scanner.
+injection test proving the control is not vacuous. **Those corpora gate every
+rule, bundled or contributed** -- see `test_rule_files.py`. A rule change that
+needs one of those fixtures relaxed is the wrong change: a scanner whose findings
+get skimmed is worse than no scanner.
+
+**Adding a rule** means a YAML file in `src/mcpscan/rules/`, positive *and*
+negative cases inside it, a `remediation`, and `docs/rules/<ID>.md`. All four are
+enforced; the negative cases are enforced by the schema itself.
 
 1. [x] CLI and target loader
 2. [x] Sandbox + escape test suite
 3. [x] stdio transport, MCP client
 4. [x] Static analyser, 3 rules
-5. [ ] YAML rule engine, JSON report   <- current
-6. [ ] Dynamic prober, rug pull detection
+5. [x] YAML rule engine, JSON report
+6. [ ] Dynamic prober, rug pull detection   <- current
 7. [ ] SARIF output
 8. [ ] HTML report
 

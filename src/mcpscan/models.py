@@ -223,6 +223,14 @@ class Finding(BaseModel):
     related: list[Location] = Field(default_factory=list)
     evidence: str | None = None
     subject: str = ""
+    #: What to do about it. Required of every rule by the YAML schema: a rule
+    #: that cannot say what to do about its finding is not finished, and a report
+    #: full of "we detected a thing" is one nobody acts on. SARIF `help.text`.
+    remediation: str = ""
+    #: Where the rule is documented, by convention `docs/rules/<ID>.md` plus an
+    #: optional `#anchor`. A path in data is a path that rots; a convention can
+    #: be checked in both directions. SARIF `helpUri`.
+    help_uri: str = ""
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("evidence")

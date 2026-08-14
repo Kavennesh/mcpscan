@@ -16,20 +16,34 @@ something. Both fields are printed whether or not anything was found.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 from mcpscan.document import MetadataDocument
+from mcpscan.engine import CoverageNote, RuleSet, ScanState
 from mcpscan.models import Finding
-from mcpscan.rules import InvisibleUnicodeRule, ModelDirectedInstructionRule, RuleSet
+from mcpscan.ruleloader import load_all
 from mcpscan.source import SourceTool, SourceTree, extract_by_name, extract_tools, load_tree
 from mcpscan.taint import UnsanitisedSinkRule
 
-#: The three rules of step 4. Step 5 will add YAML-defined rules alongside these.
-DEFAULT_RULES = RuleSet(
-    metadata_rules=(InvisibleUnicodeRule(), ModelDirectedInstructionRule()),
-    source_rules=(UnsanitisedSinkRule(),),
-)
+
+@lru_cache(maxsize=4)
+def default_rules(extra: Path | None = None) -> RuleSet:
+    """The bundled YAML pack plus MCP-003, which stays as code.
+
+    Cached: parsing and compiling the pack is per-process work, not per-target,
+    and a scan of a client config can hold a dozen targets.
+
+    Taint analysis is not pattern matching, and forcing it into the schema would
+    corrupt the schema for the rules that do fit. Every *other* rule -- bundled
+    or contributed -- comes through the same loader.
+    """
+    loaded = load_all(extra)
+    return RuleSet(
+        metadata_rules=tuple(item.rule for item in loaded),
+        source_rules=(UnsanitisedSinkRule(),),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,13 +101,25 @@ class AnalysisResult:
     ran: list[str] = field(default_factory=list)
     #: (rule id, why) -- coverage a reader must be told about.
     skipped: list[tuple[str, str]] = field(default_factory=list)
+    #: Everything else the scan could not do: a quarantined pattern, a truncated
+    #: listing, a request that went unanswered.
+    notes: list[CoverageNote] = field(default_factory=list)
 
     def at_or_above(self, threshold: Any) -> list[Finding]:
         return [f for f in self.findings if f.severity.rank >= threshold.rank]
 
 
-def analyse(subject: Subject, rules: RuleSet = DEFAULT_RULES) -> AnalysisResult:
+def analyse(
+    subject: Subject,
+    rules: RuleSet | None = None,
+    state: ScanState | None = None,
+) -> AnalysisResult:
     """Run every applicable rule over ``subject``."""
+    if rules is None:
+        rules = default_rules()
+    if state is None:
+        state = ScanState()
+
     findings: list[Finding] = []
     ran: list[str] = []
     skipped: list[tuple[str, str]] = []
@@ -103,7 +129,7 @@ def analyse(subject: Subject, rules: RuleSet = DEFAULT_RULES) -> AnalysisResult:
             skipped.append((rule.meta.id, "no server metadata available"))
             continue
         ran.append(rule.meta.id)
-        findings.extend(rule.check(subject.document))
+        findings.extend(rule.check(subject.document, state))
 
     for source_rule in rules.source_rules:
         if subject.tree is None:
@@ -127,4 +153,5 @@ def analyse(subject: Subject, rules: RuleSet = DEFAULT_RULES) -> AnalysisResult:
         unparsed=list(subject.tree.unparsed) if subject.tree else [],
         ran=ran,
         skipped=skipped,
+        notes=list(state.notes),
     )

@@ -19,16 +19,16 @@ from pathlib import Path
 
 import pytest
 
-from mcpscan.analyser import DEFAULT_RULES, Subject, analyse
+from mcpscan.analyser import Subject, analyse, default_rules
 from mcpscan.document import FieldKind, MetadataDocument, TextField
-from mcpscan.rules import InvisibleUnicodeRule, ModelDirectedInstructionRule
 from tests.fixtures.descriptions.benign import BENIGN_DESCRIPTIONS
 from tests.fixtures.descriptions.benign_unicode import BENIGN_UNICODE
 from tests.fixtures.servers import clean_metadata
+from tests.rulehelpers import rule
 from tests.sourcefixtures import materialise
 
-UNICODE = InvisibleUnicodeRule()
-INSTRUCTIONS = ModelDirectedInstructionRule()
+UNICODE = rule("MCP-001")
+INSTRUCTIONS = rule("MCP-002")
 
 
 def clean_document() -> MetadataDocument:
@@ -182,14 +182,14 @@ def test_the_clean_source_tree_produces_no_findings(tmp_path: Path) -> None:
     genuinely uses.
     """
     root = materialise(tmp_path, "clean_server")
-    result = analyse(Subject.from_path(root), DEFAULT_RULES)
+    result = analyse(Subject.from_path(root), default_rules())
     assert result.findings == [], describe(result.findings)
     assert "MCP-003" in result.ran, "the rule was skipped, so this proves nothing"
 
 
 def test_the_clean_tree_control_is_not_vacuous(tmp_path: Path) -> None:
     root = materialise(tmp_path, "clean_server", "vulnerable_server")
-    result = analyse(Subject.from_path(root), DEFAULT_RULES)
+    result = analyse(Subject.from_path(root), default_rules())
     assert [f for f in result.findings if f.rule_id == "MCP-003"]
 
 

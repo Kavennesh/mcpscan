@@ -1,0 +1,105 @@
+# MCP-001 -- invisible and deceptive Unicode in tool metadata.
+#
+# This rule is why the schema has hooks. Its patterns are ordinary character
+# classes, but three things about how it matches and reports cannot be written
+# as a pattern, and each names an entry in a closed registry in engine.py:
+#
+#   match_mode: coalesced_runs
+#     A 200-character tag payload is one problem, not 200. And bidi controls are
+#     format characters too, so without letting the specific pattern claim its
+#     characters first, one override is reported twice -- once as what it is,
+#     once as a bare \p{Cf}.
+#
+#   predicate: format_char_is_illegitimate
+#     Whether a format character is doing its job depends on its neighbours and
+#     on the script around it. ZWJ builds emoji sequences, ZWNJ is orthographic
+#     in Persian and Indic scripts, LRM/RLM make bidi text display correctly.
+#     No regex can ask that question.
+#
+#   reporter: codepoints
+#     The finding must name each character and its byte offset, and must be
+#     suppressed entirely when every character in a run turned out legitimate.
+#
+# Three hooks, all of which already existed as reviewed code before this file
+# did. A fourth would have meant the schema was wrong for this rule.
+
+id: MCP-001
+title: Invisible or deceptive Unicode in tool metadata
+severity: high
+
+remediation: >
+  Remove the characters, or replace them with their visible equivalents. Text a
+  reviewer cannot see is text they cannot review, and every one of these reaches
+  the model exactly as the visible characters around it do.
+
+match_mode: coalesced_runs
+predicate: format_char_is_illegitimate
+reporter: codepoints
+
+patterns:
+  - name: bidi-control
+    # U+202A-202E embeddings and overrides, U+2066-2069 isolates.
+    regex: '[‪-‮⁦-⁩]+'
+    confidence: high
+    message: >
+      Bidirectional override or isolate in metadata. These reorder how text is
+      displayed, so a reviewer does not read what the model receives.
+
+  - name: tag-characters
+    # U+E0000-E007F. Invisible in every renderer, and a full ASCII alphabet.
+    regex: '[\U000E0000-\U000E007F]+'
+    confidence: high
+    message: >
+      Unicode tag characters in metadata. They render as nothing in every client
+      and can spell out an entire hidden instruction in ASCII.
+
+  - name: format-character
+    # The broad sweep. Runs last so the two patterns above claim their
+    # characters first, and every match is filtered by the predicate.
+    regex: '\p{Cf}+'
+    confidence: medium
+    message: >
+      Invisible format character in metadata with no legitimate role in this text.
+
+  - name: private-use
+    regex: '\p{Co}+'
+    confidence: medium
+    message: >
+      Private use area character in metadata. Its appearance depends entirely on
+      the font, so what a reviewer sees is not defined.
+
+tests:
+  positive:
+    - text: "Reads a file.‮payload"
+      expect: bidi-control
+    - text: "Reads a file.\U000E0049\U000E0067\U000E006E"
+      expect: tag-characters
+    - text: "Reads a file.​hidden"
+      expect: format-character
+    - text: "Reads a file."
+      expect: private-use
+    # A ZWJ between two ASCII characters. "That is how emoji work" is only an
+    # excuse where there are emoji -- the same character is silent in the
+    # negative cases below.
+    - text: "file.‍PAYLOAD"
+      expect: format-character
+    # A BOM anywhere but position zero has no job.
+    - text: "Returns﻿contents."
+      expect: format-character
+
+  negative:
+    # Family emoji: three pictographs joined by two ZWJs.
+    - text: "Search \U0001F468‍\U0001F469‍\U0001F467 family records."
+    # Pride flag: pictograph + variation selector + ZWJ + pictograph. The
+    # neighbour check has to walk past U+FE0F to find the flag.
+    - text: "Returns the \U0001F3F3️‍\U0001F308 emoji for a locale."
+    # Persian, where the ZWNJ is orthographic: removing it changes the word.
+    - text: "ملف‌ها را فهرست کند."
+    # Hebrew with a directional mark before an ASCII identifier.
+    - text: "מחזיר את תוכן הקובץ ‏README.md"
+    # A leading BOM is how a UTF-8 file legitimately begins.
+    - text: "﻿Returns the file contents, BOM included."
+    # No format characters at all: CJK, accented Latin, mathematical symbols.
+    - text: "ファイルの内容を返します。"
+    - text: "Récupère le contenu d'un fichier à partir d'un chemin absolu."
+    - text: "Computes ∑(xᵢ) over the selected column. Handles ≥ and ≤."

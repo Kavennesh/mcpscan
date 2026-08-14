@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from mcpscan.analyser import DEFAULT_RULES, Subject, analyse
+from mcpscan.analyser import Subject, analyse, default_rules
 from mcpscan.models import Confidence, Severity
 from mcpscan.source import SourceTool, SourceTree, extract_tools
 from mcpscan.taint import UnsanitisedSinkRule, analyse_tool
@@ -223,7 +223,7 @@ def test_a_sink_in_a_return_statement_is_reported_once() -> None:
 
 def test_no_finding_is_duplicated_across_a_whole_tree(tmp_path: Path) -> None:
     root = materialise(tmp_path, "vulnerable_server")
-    result = analyse(Subject.from_path(root), DEFAULT_RULES)
+    result = analyse(Subject.from_path(root), default_rules())
     seen = [
         (f.rule_id, f.location.describe(), f.metadata.get("parameter"))
         for f in result.findings
@@ -236,7 +236,7 @@ def test_no_finding_is_duplicated_across_a_whole_tree(tmp_path: Path) -> None:
 # --------------------------------------------------------------------------
 def test_the_vulnerable_fixture_reports_every_shape(tmp_path: Path) -> None:
     root = materialise(tmp_path, "vulnerable_server")
-    result = analyse(Subject.from_path(root), DEFAULT_RULES)
+    result = analyse(Subject.from_path(root), default_rules())
     taint = [f for f in result.findings if f.rule_id == "MCP-003"]
 
     tools = {f.metadata["tool"] for f in taint}
@@ -253,14 +253,14 @@ def test_the_vulnerable_fixture_reports_every_shape(tmp_path: Path) -> None:
 
 def test_findings_are_sorted_worst_first(tmp_path: Path) -> None:
     root = materialise(tmp_path, "vulnerable_server")
-    result = analyse(Subject.from_path(root), DEFAULT_RULES)
+    result = analyse(Subject.from_path(root), default_rules())
     ranks = [f.severity.rank for f in result.findings]
     assert ranks == sorted(ranks, reverse=True)
 
 
 def test_paths_are_relative_to_the_scan_root(tmp_path: Path) -> None:
     root = materialise(tmp_path, "vulnerable_server")
-    result = analyse(Subject.from_path(root), DEFAULT_RULES)
+    result = analyse(Subject.from_path(root), default_rules())
     for finding in result.findings:
         if finding.location.path is not None:
             assert not finding.location.path.is_absolute()
@@ -270,6 +270,6 @@ def test_paths_are_relative_to_the_scan_root(tmp_path: Path) -> None:
 def test_fixtures_parse(tmp_path: Path, fixture: str) -> None:
     """A fixture that does not parse would silently prove nothing."""
     root = materialise(tmp_path, fixture)
-    result = analyse(Subject.from_path(root), DEFAULT_RULES)
+    result = analyse(Subject.from_path(root), default_rules())
     assert result.unparsed == []
     assert result.files_scanned == 1

@@ -13,9 +13,9 @@ import pytest
 
 from mcpscan.document import FieldKind, MetadataDocument, TextField
 from mcpscan.models import Confidence, Severity
-from mcpscan.rules import ModelDirectedInstructionRule
+from tests.rulehelpers import rule
 
-RULE = ModelDirectedInstructionRule()
+RULE = rule("MCP-002")
 
 
 def check(text: str, kind: FieldKind = FieldKind.TOOL_DESCRIPTION) -> list:

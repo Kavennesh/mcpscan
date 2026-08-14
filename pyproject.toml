@@ -35,15 +35,22 @@ mcpscan = "mcpscan.cli:main"
 requires = ["uv_build>=0.12.3,<0.13.0"]
 build-backend = "uv_build"
 
+[tool.uv.build-backend]
+# The bundled rule pack is data, not code, so it needs saying explicitly or an
+# installed mcpscan has an empty rule set and reports every target as clean.
+source-include = ["src/mcpscan/rules/*.yaml"]
+
 [dependency-groups]
 dev = [
     "mypy>=2.3.0",
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
     "ruff>=0.16.3",
-    # Stubs only. `regex` itself is already a runtime dependency; without these
-    # mypy --strict cannot see through it and MCP-001's patterns go unchecked.
+    # Stubs only. `regex` and `pyyaml` are already runtime dependencies; without
+    # these mypy --strict cannot see through them, and the rule engine's two
+    # most security-relevant modules go unchecked.
     "types-regex>=2024.11.6",
+    "types-PyYAML>=6.0.12",
 ]
 
 [tool.pytest.ini_options]

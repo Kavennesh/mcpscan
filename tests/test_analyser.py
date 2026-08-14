@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from mcpscan.analyser import DEFAULT_RULES, AnalysisResult, Subject, analyse
+from mcpscan.analyser import AnalysisResult, Subject, analyse, default_rules
 from mcpscan.document import MetadataDocument
 from mcpscan.models import Confidence, Finding, Location, Severity
 from tests.sourcefixtures import materialise
@@ -27,7 +27,7 @@ POISONED = MetadataDocument(
 
 
 def test_all_three_rules_are_registered() -> None:
-    assert DEFAULT_RULES.ids() == ["MCP-001", "MCP-002", "MCP-003"]
+    assert default_rules().ids() == ["MCP-001", "MCP-002", "MCP-003"]
 
 
 # --------------------------------------------------------------------------
@@ -52,7 +52,7 @@ def test_a_source_tree_with_no_tools_says_so_rather_than_reporting_clean(
     root.mkdir()
     (root / "util.py").write_text("def helper(x):\n    return x\n")
 
-    result = analyse(Subject.from_path(root), DEFAULT_RULES)
+    result = analyse(Subject.from_path(root), default_rules())
     assert result.skipped == [("MCP-003", "no tool definitions found in source")]
     assert result.files_scanned == 1
 
@@ -62,13 +62,13 @@ def test_unparsed_files_reach_the_result(tmp_path: Path) -> None:
     root.mkdir()
     (root / "broken.py").write_text("def (:\n")
 
-    result = analyse(Subject.from_path(root), DEFAULT_RULES)
+    result = analyse(Subject.from_path(root), default_rules())
     assert [path.name for path, _ in result.unparsed] == ["broken.py"]
 
 
 def test_a_path_scan_runs_every_rule(tmp_path: Path) -> None:
     root = materialise(tmp_path, "poisoned_metadata", "vulnerable_server")
-    result = analyse(Subject.from_path(root), DEFAULT_RULES)
+    result = analyse(Subject.from_path(root), default_rules())
     assert result.ran == ["MCP-001", "MCP-002", "MCP-003"]
     assert result.skipped == []
 

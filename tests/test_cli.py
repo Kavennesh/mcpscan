@@ -14,6 +14,7 @@ cannot run must refuse loudly rather than quietly reporting nothing.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from typer.testing import CliRunner
@@ -142,3 +143,95 @@ def test_an_unparseable_file_is_named_in_the_output(tmp_path: Path) -> None:
 
 def test_configs_command_still_works() -> None:
     assert runner.invoke(app, ["configs"]).exit_code == EXIT_OK
+
+
+# --------------------------------------------------------------------------
+# report formats
+# --------------------------------------------------------------------------
+def test_json_output_is_parseable_with_nothing_else_on_stdout(tmp_path: Path) -> None:
+    """`mcpscan scan --format json > report.json` must produce a valid file.
+
+    Progress chatter belongs on stderr. A "resolved 1 target(s)" line in front
+    of the opening brace makes the document unparseable, and it is the kind of
+    regression that only shows up in someone's pipeline.
+    """
+    root = materialise(tmp_path, "vulnerable_server")
+    result = CliRunner().invoke(
+        app,
+        ["scan", "--path", str(root), "--format", "json", "--yes-i-am-authorised"],
+    )
+    assert result.exit_code == EXIT_FINDINGS
+    payload = json.loads(result.stdout)
+    assert payload["schema_version"] == 1
+    assert payload["findings"]
+
+
+def test_json_output_carries_coverage_even_when_clean(tmp_path: Path) -> None:
+    root = materialise(tmp_path, "clean_server")
+    result = CliRunner().invoke(
+        app,
+        ["scan", "--path", str(root), "--format", "json", "--yes-i-am-authorised"],
+    )
+    assert result.exit_code == EXIT_OK
+    payload = json.loads(result.stdout)
+    assert payload["findings"] == []
+    assert payload["coverage"]["files_scanned"] == 1
+    assert payload["coverage"]["rules_run"]
+
+
+def test_output_flag_writes_a_file(tmp_path: Path) -> None:
+    root = materialise(tmp_path, "vulnerable_server")
+    destination = tmp_path / "report.json"
+    result = CliRunner().invoke(
+        app,
+        [
+            "scan", "--path", str(root),
+            "--format", "json", "--output", str(destination),
+            "--yes-i-am-authorised",
+        ],
+    )
+    assert result.exit_code == EXIT_FINDINGS
+    assert json.loads(destination.read_text())["schema_version"] == 1
+
+
+def test_exit_codes_are_identical_across_formats(tmp_path: Path) -> None:
+    """The format changes what is printed, never what the exit code means."""
+    for fixture, expected in [("clean_server", EXIT_OK), ("vulnerable_server", EXIT_FINDINGS)]:
+        root = materialise(tmp_path / fixture, fixture)
+        for fmt in ("text", "json"):
+            result = CliRunner().invoke(
+                app,
+                ["scan", "--path", str(root), "--format", fmt, "--yes-i-am-authorised"],
+            )
+            assert result.exit_code == expected, f"{fixture}/{fmt}"
+
+
+# --------------------------------------------------------------------------
+# the rules subcommands
+# --------------------------------------------------------------------------
+def test_rules_list_shows_the_bundled_pack() -> None:
+    result = CliRunner().invoke(app, ["rules", "list"])
+    assert result.exit_code == EXIT_OK
+    assert "MCP-001" in result.output
+    assert "MCP-002" in result.output
+    assert "MCP-003" in result.output  # named as code, not YAML
+
+
+def test_rules_lint_never_fails_the_build() -> None:
+    """Advisory means advisory. The timeout is the control, not this."""
+    result = CliRunner().invoke(app, ["rules", "lint"])
+    assert result.exit_code == EXIT_OK
+
+
+def test_a_broken_rule_directory_is_a_scanner_error(tmp_path: Path) -> None:
+    """Exit 2, not 1: a rule that will not load is our problem, not a finding."""
+    rules = tmp_path / "rules"
+    rules.mkdir()
+    (rules / "bad.yaml").write_text("id: NOPE\ntitle: x\n")
+
+    target_dir = materialise(tmp_path, "clean_server")
+    result = CliRunner().invoke(
+        app,
+        ["scan", "--path", str(target_dir), "--rules", str(rules), "--yes-i-am-authorised"],
+    )
+    assert result.exit_code == EXIT_ERROR

@@ -21,9 +21,9 @@ import pytest
 
 from mcpscan.document import FieldKind, MetadataDocument, TextField
 from mcpscan.models import Confidence, Severity
-from mcpscan.rules import InvisibleUnicodeRule
+from tests.rulehelpers import rule
 
-RULE = InvisibleUnicodeRule()
+RULE = rule("MCP-001")
 
 
 def check(text: str, kind: FieldKind = FieldKind.TOOL_DESCRIPTION) -> list:

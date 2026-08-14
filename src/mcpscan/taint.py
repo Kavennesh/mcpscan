@@ -43,8 +43,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
+from mcpscan.engine import RuleMeta
 from mcpscan.models import Confidence, Finding, Location, Severity
-from mcpscan.rules import RuleMeta
 from mcpscan.source import SourceTool, SourceTree, dotted_name
 
 #: Dotted names that execute a command. Strings, never attribute access -- see
@@ -348,6 +348,13 @@ class UnsanitisedSinkRule:
         id="MCP-003",
         title="Tool parameter reaches a dangerous sink unsanitised",
         severity=Severity.CRITICAL,
+        remediation=(
+            "Do not pass a tool parameter into a shell, an interpreter, or a "
+            "filesystem path without constraining it first. Prefer an allowlist "
+            "lookup over interpolation; where a shell is unavoidable, quote with "
+            "shlex.quote. The model chooses these arguments, and it is reading "
+            "descriptions written by the same server."
+        ),
     )
 
     def check(self, tree: SourceTree, tools: Sequence[SourceTool]) -> Iterator[Finding]:
@@ -382,6 +389,8 @@ class UnsanitisedSinkRule:
             location=location,
             related=[parameter],
             evidence=_unparse(hit.node),
+            remediation=self.meta.remediation,
+            help_uri=self.meta.help_uri,
             metadata={
                 "sink": hit.sink,
                 "parameter": hit.parameter,

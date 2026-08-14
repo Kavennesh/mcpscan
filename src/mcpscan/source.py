@@ -114,17 +114,21 @@ def load_tree(root: Path) -> SourceTree:
     """Parse every Python file under ``root``. Never raises on bad input."""
     tree = SourceTree(root=root)
     for path in python_files(root):
+        # Reported relative, like every other path in a finding: an absolute one
+        # leaks the scanner's filesystem layout and matches nothing the
+        # developer recognises. The key stays absolute -- that is what reads it.
+        shown = relative_to_root(path, root)
         try:
             text = path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError) as exc:
-            tree.unparsed.append((path, f"unreadable: {exc}"))
+            tree.unparsed.append((shown, f"unreadable: {exc}"))
             continue
         try:
             tree.modules[path] = ast.parse(text, filename=str(path))
         except (SyntaxError, ValueError, RecursionError) as exc:
             # A target is free to ship a file that does not parse -- a Python 2
             # leftover, a template, something generated. Not our error to raise.
-            tree.unparsed.append((path, f"{type(exc).__name__}: {exc}"))
+            tree.unparsed.append((shown, f"{type(exc).__name__}: {exc}"))
     return tree
 
 
