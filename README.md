@@ -25,8 +25,13 @@ the sandbox is the core of the tool rather than a wrapper around it.
 
 ## Install
 
+Not released yet. Build from source:
+
 ```bash
-pip install mcpscan
+git clone https://github.com/Kavennesh/mcpscan
+cd mcpscan
+uv sync
+uv run mcpscan --help
 ```
 
 Python 3.11+. Docker is required only for dynamic analysis.
