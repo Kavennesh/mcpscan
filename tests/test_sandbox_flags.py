@@ -211,6 +211,50 @@ def test_network_is_enabled_only_when_limits_ask_for_it() -> None:
     assert "--network host" not in " ".join(argv)
 
 
+def test_stdin_is_attached_only_when_a_session_asks_for_it() -> None:
+    """`-i` is the entire flag-level difference between run() and session().
+
+    run() launches with stdin on DEVNULL and there is nothing to attach; a stdio
+    JSON-RPC conversation needs the pipe. Nothing else about the container
+    changes, which is what lets the escape suite keep vouching for both paths.
+    """
+    assert "--interactive" not in runner_options()
+    assert "-i" not in runner_options()
+
+    interactive = runner_options(interactive=True)
+    assert interactive["--interactive"] == [""]
+
+
+@pytest.mark.parametrize("interactive", [False, True])
+def test_no_tty_is_ever_allocated(interactive: bool) -> None:
+    """A TTY would merge stderr into stdout and mangle the framing.
+
+    Both consequences are fatal to a scanner rather than merely inconvenient.
+    Line-discipline processing rewrites bytes in a newline-delimited protocol,
+    and merging the streams destroys the distinction between a server's protocol
+    channel and its log channel -- which is precisely the boundary that makes
+    "this server writes non-MCP content to stdout" a finding at all.
+    """
+    argv = build(interactive=interactive)
+    flags, _ = split(argv, str(sandbox.Image.RUNNER))
+    opts = options(flags)
+
+    assert "--tty" not in opts
+    assert "-t" not in opts
+    assert "-it" not in opts
+    assert "--interactive --tty" not in " ".join(argv)
+
+
+def test_an_interactive_container_is_confined_exactly_as_a_batch_one_is() -> None:
+    """`-i` must be additive. Anything else it changed would be a hole."""
+    batch = options(split(build(), str(sandbox.Image.RUNNER))[0])
+    session = options(split(build(interactive=True), str(sandbox.Image.RUNNER))[0])
+
+    assert set(session) - set(batch) == {"--interactive"}
+    for flag, value in batch.items():
+        assert session[flag] == value, f"{flag} changed when stdin was attached"
+
+
 def test_network_is_refused_for_the_runner_image() -> None:
     """The negative half of fetch/execute separation.
 

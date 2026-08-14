@@ -46,7 +46,8 @@ import subprocess
 import tempfile
 import time
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -80,6 +81,12 @@ _CID_POLL_S: Final = 0.02
 _CID_WAIT_S: Final = 10.0
 _DOCKER_CALL_S: Final = 30.0
 _KILL_GRACE_S: Final = 20.0
+
+#: How long a session waits for a server to exit of its own accord after its
+#: stdin is closed. The MCP spec asks for close-stdin, then SIGTERM, then
+#: SIGKILL; we skip SIGTERM for the reason in the module docstring, so this is
+#: the entire voluntary-shutdown budget.
+_STDIN_CLOSE_GRACE_S: Final = 2.0
 
 _INSPECT_FORMAT: Final = '{{.Id}} {{.Created}} {{index .Config.Labels "mcpscan.session"}}'
 
@@ -230,6 +237,34 @@ async def _drain(
                 truncated_event.set()
 
 
+def _make_workdir() -> tuple[Path, Path]:
+    """A scratch directory and the cidfile path inside it.
+
+    The cidfile must *not* exist -- ``docker run`` refuses to overwrite one.
+    """
+    workdir = Path(tempfile.mkdtemp(prefix="mcpscan-"))
+    return workdir, workdir / "cid"
+
+
+async def _destroy(container_id: str, cidfile: Path, workdir: Path) -> None:
+    """Remove the container and the scratch directory. Never raises.
+
+    Shared by :meth:`SandboxHandle.run` and :meth:`SandboxHandle.session` on
+    purpose: this is the half of the "no ``--rm``" trade that stops a container
+    leaking, and two copies of it would eventually disagree.
+
+    The re-read of the cidfile closes the window where an exception or a
+    cancellation lands between ``docker run`` creating the container and the
+    caller learning its id. The cidfile is written at creation, so if a container
+    exists its id is already on disk.
+    """
+    if not container_id:
+        container_id = await _read_cid(cidfile, timeout=0.0)
+    if container_id:
+        await _docker("rm", "--force", container_id)
+    shutil.rmtree(workdir, ignore_errors=True)
+
+
 async def _read_cid(cidfile: Path, *, timeout: float = _CID_WAIT_S) -> str:
     """Wait for the docker client to record the container id.
 
@@ -360,6 +395,306 @@ async def _reap_once() -> None:
 
 
 # --------------------------------------------------------------------------
+# streaming sessions
+# --------------------------------------------------------------------------
+@dataclass(frozen=True, slots=True)
+class SessionResult:
+    """What became of a session's container, available once it has been closed.
+
+    The counterpart of :class:`SandboxResult` for the streaming path. There is no
+    ``stdout`` field: the caller already consumed it through
+    :meth:`SandboxSession.read`, and buffering a second copy would hand a target
+    an easy way to cost us twice the memory it was capped at.
+    """
+
+    outcome: Outcome
+    exit_code: int | None
+    stderr: bytes
+    stdout_seen: int
+    stdout_truncated: bool
+    duration_s: float
+    container_id: str
+
+
+class SandboxSession:
+    """A live container with its stdin and stdout attached, for JSON-RPC.
+
+    :meth:`SandboxHandle.run` cannot serve a protocol client: it launches with
+    ``stdin`` on ``DEVNULL`` and hands back ``stdout`` only once the process is
+    dead. A conversation needs to write and read while the target is running, so
+    this is the second, longer-lived shape of the same container.
+
+    It is the *same* container in every respect that matters -- identical flags,
+    identical teardown, identical refusal to give a runner network -- and it
+    keeps the two properties that are easy to lose when a stream gets a consumer:
+
+    **Output is still drained, never merely capped.** A background task reads
+    stdout continuously into a bounded buffer whether or not anyone is calling
+    :meth:`read`. If the reader stalls -- and it will, every time it is waiting
+    on a response the server has decided not to send -- the OS pipe would
+    otherwise fill, block the ``docker`` client, and leave us unable to reap the
+    container we are trying to kill.
+
+    **The cap is on bytes seen, not bytes buffered.** The consumer drains the
+    buffer as it goes, so a buffer-sized meter would never trip: a server could
+    stream forever in small sips and never exceed it. Cumulative bytes is the
+    only meter that actually bounds a flood.
+
+    stderr is drained too, and separately. Per the 2025-11-25 stdio transport a
+    server MAY log anything there and a client SHOULD NOT read it as an error
+    signal -- but an undrained stderr pipe deadlocks the server just as surely as
+    stdout would.
+    """
+
+    __slots__ = (
+        "_buffer",
+        "_cidfile",
+        "_closed",
+        "_container_id",
+        "_data",
+        "_duration_s",
+        "_eof",
+        "_exit_code",
+        "_exited",
+        "_forced",
+        "_kill_task",
+        "_limits",
+        "_proc",
+        "_pump_task",
+        "_started",
+        "_stderr",
+        "_stderr_task",
+        "_stdin_closed",
+        "_stdout_seen",
+        "_truncated",
+        "_watchdog",
+    )
+
+    def __init__(
+        self,
+        proc: asyncio.subprocess.Process,
+        *,
+        limits: Limits,
+        cidfile: Path,
+    ) -> None:
+        self._proc = proc
+        self._limits = limits
+        self._cidfile = cidfile
+        self._buffer = bytearray()
+        self._data = asyncio.Event()
+        self._eof = False
+        self._stdout_seen = 0
+        self._truncated = False
+        self._forced: Outcome | None = None
+        self._container_id = ""
+        self._started = time.monotonic()
+        self._duration_s = 0.0
+        self._exit_code: int | None = None
+        self._stderr = b""
+        self._stdin_closed = False
+        self._closed = False
+        self._kill_task: asyncio.Task[None] | None = None
+        self._exited = asyncio.create_task(proc.wait())
+        self._pump_task = asyncio.create_task(self._pump())
+        self._stderr_task = asyncio.create_task(self._drain_stderr())
+        self._watchdog = asyncio.create_task(self._watch())
+
+    # -- the conversation -----------------------------------------------
+    async def send(self, data: bytes) -> None:
+        """Write to the target's stdin.
+
+        A broken pipe means the target died, which is a normal outcome for a
+        scan and not a sandbox failure -- the caller discovers it as EOF from
+        :meth:`read`, where it belongs.
+        """
+        if self._closed:
+            raise SandboxError("session is closed")
+        stdin = self._proc.stdin
+        if stdin is None or self._stdin_closed:
+            return
+        try:
+            stdin.write(data)
+            await stdin.drain()
+        except (BrokenPipeError, ConnectionResetError):
+            self._stdin_closed = True
+
+    async def read(self, n: int) -> bytes:
+        """Up to ``n`` buffered bytes of stdout, waiting if none are ready.
+
+        Returns ``b""`` at end of stream, which is the only signal the caller
+        gets that the target is gone.
+        """
+        while True:
+            if self._buffer:
+                taken = bytes(self._buffer[:n])
+                del self._buffer[:n]
+                return taken
+            if self._eof:
+                return b""
+            # No await between the check above and the wait below, so the pump
+            # cannot set the event into the gap and be missed.
+            self._data.clear()
+            await self._data.wait()
+
+    async def close_stdin(self) -> None:
+        """Signal shutdown the way the spec asks: close the input stream first."""
+        if self._stdin_closed:
+            return
+        self._stdin_closed = True
+        stdin = self._proc.stdin
+        if stdin is None:
+            return
+        try:
+            stdin.close()
+            await stdin.wait_closed()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return
+
+    @property
+    def alive(self) -> bool:
+        return not self._eof and self._proc.returncode is None
+
+    @property
+    def stdout_seen(self) -> int:
+        return self._stdout_seen
+
+    def result(self) -> SessionResult:
+        """The outcome. Only meaningful once the session context has exited."""
+        if not self._closed:
+            raise SandboxError("session result is not available until the session closes")
+        return SessionResult(
+            outcome=self._outcome(),
+            exit_code=self._exit_code,
+            stderr=self._stderr,
+            stdout_seen=self._stdout_seen,
+            stdout_truncated=self._truncated,
+            duration_s=self._duration_s,
+            container_id=self._container_id,
+        )
+
+    # -- background tasks -----------------------------------------------
+    async def _pump(self) -> None:
+        stream = self._proc.stdout
+        if stream is None:
+            self._eof = True
+            self._data.set()
+            return
+        while True:
+            try:
+                chunk = await stream.read(_CHUNK)
+            except (ConnectionResetError, BrokenPipeError):
+                chunk = b""
+            if not chunk:
+                self._eof = True
+                self._data.set()
+                return
+
+            before = self._stdout_seen
+            self._stdout_seen += len(chunk)
+
+            if self._truncated:
+                # Past the cap: keep reading so the pipe never fills and the
+                # container stays reapable, but keep none of it.
+                continue
+
+            room = self._limits.stdout_bytes - before
+            if room > 0:
+                self._buffer.extend(chunk[:room])
+                self._data.set()
+
+            if self._stdout_seen > self._limits.stdout_bytes:
+                self._truncated = True
+                if self._forced is None:
+                    self._forced = Outcome.OUTPUT_CAP
+                # Scheduled, never awaited here. Awaiting would stop the drain
+                # for the length of a `docker kill`, the pipe would fill, and
+                # the `docker` client would block -- leaving the container we
+                # are trying to kill unable to finish dying. Draining is what
+                # makes the kill possible, so it must not pause for it.
+                self._request_kill()
+
+    async def _drain_stderr(self) -> None:
+        stream = self._proc.stderr
+        if stream is None:
+            return
+        self._stderr, _ = await _drain(stream, STDERR_BYTES, None)
+
+    async def _watch(self) -> None:
+        """Wall-clock budget for the whole session, not for one request."""
+        await asyncio.sleep(self._limits.wall_clock_s)
+        if self._forced is None:
+            self._forced = Outcome.TIMEOUT
+        self._request_kill()
+
+    def _request_kill(self) -> None:
+        """Start killing the container without blocking the caller.
+
+        At most one kill is ever in flight: a flood that trips the output cap
+        and then runs out the wall clock would otherwise queue a second
+        ``docker kill`` behind the first for a container that is already gone.
+        """
+        if self._kill_task is None:
+            self._kill_task = asyncio.create_task(self._kill())
+
+    async def _kill(self) -> None:
+        if not self._container_id:
+            self._container_id = await _read_cid(self._cidfile)
+        if self._container_id:
+            await _docker("kill", self._container_id)
+
+    def _outcome(self) -> Outcome:
+        # Same precedence as run(): a launch that never produced a container
+        # outranks everything, then the reasons we intervened, then OOM, then
+        # an ordinary exit.
+        if not self._container_id:
+            return Outcome.LAUNCH_FAILED
+        if self._forced is not None:
+            return self._forced
+        return Outcome.EXITED
+
+    # -- teardown -------------------------------------------------------
+    async def _finish(self) -> str:
+        """Close the target down and collect the verdict. Returns the container id."""
+        self._watchdog.cancel()
+        await self.close_stdin()
+
+        try:
+            await asyncio.wait_for(asyncio.shield(self._exited), timeout=_STDIN_CLOSE_GRACE_S)
+        except TimeoutError:
+            # It had its chance to leave politely. The module docstring's
+            # argument applies: a target that ignores a shutdown signal is
+            # exactly the case this tool is built for, so no SIGTERM.
+            self._request_kill()
+            try:
+                await asyncio.wait_for(asyncio.shield(self._exited), timeout=_KILL_GRACE_S)
+            except TimeoutError:
+                self._proc.kill()
+                await self._exited
+
+        await self._exited
+        self._pump_task.cancel()
+        pending = [self._pump_task, self._watchdog]
+        if self._kill_task is not None:
+            # Awaited rather than cancelled: an abandoned `docker kill` would
+            # leak the container it was on its way to removing.
+            pending.append(self._kill_task)
+        await asyncio.gather(*pending, return_exceptions=True)
+        await self._stderr_task
+
+        self._duration_s = time.monotonic() - self._started
+        if not self._container_id:
+            self._container_id = await _read_cid(self._cidfile, timeout=0.0)
+
+        state = await _inspect_state(self._container_id) if self._container_id else None
+        if state is not None and state.oom_killed and self._forced is None:
+            self._forced = Outcome.OOM_KILLED
+        self._exit_code = state.exit_code if state is not None else self._proc.returncode
+
+        self._closed = True
+        return self._container_id
+
+
+# --------------------------------------------------------------------------
 # the sandbox
 # --------------------------------------------------------------------------
 class SandboxHandle:
@@ -388,6 +723,7 @@ class SandboxHandle:
         env: Mapping[str, str] | None,
         mounts: Sequence[Mount],
         cidfile: Path,
+        interactive: bool = False,
     ) -> list[str]:
         """Build the ``docker run`` argv.
 
@@ -408,6 +744,14 @@ class SandboxHandle:
             ``/var/lib/docker`` on the host, whatever our own read cap says.
         ``--pids-limit``
             Counts threads, not just processes, on cgroup v2.
+
+        ``interactive`` adds ``-i`` and nothing else, so that
+        :meth:`SandboxHandle.session` can write JSON-RPC to the target's stdin.
+        It deliberately does **not** add ``--tty``: a TTY merges stderr into
+        stdout and applies line-discipline processing, which would corrupt the
+        newline-delimited framing MCP relies on and destroy the distinction
+        between a server's protocol channel and its log channel -- the one thing
+        a scanner most needs to keep separate.
 
         Raises :class:`SandboxError` if ``limits.network`` is set for anything
         but the fetcher. Refusing here rather than at the call site makes this
@@ -459,6 +803,9 @@ class SandboxHandle:
             HOSTNAME,
         ]
 
+        if interactive:
+            argv.append("--interactive")
+
         # KEY=VALUE only. A bare `-e KEY` would inherit KEY from the host
         # environment, which is how a real credential reaches a target.
         for key, value in (env or {}).items():
@@ -489,8 +836,7 @@ class SandboxHandle:
         """
         await _reap_once()
 
-        workdir = Path(tempfile.mkdtemp(prefix="mcpscan-"))
-        cidfile = workdir / "cid"  # must not exist; docker refuses otherwise
+        workdir, cidfile = _make_workdir()
         argv = cls.build_argv(
             list(command),
             image=image,
@@ -580,13 +926,72 @@ class SandboxHandle:
                 container_id=container_id,
             )
         finally:
-            # An exception or a cancellation between `docker run` creating the
-            # container and the id being read would otherwise strand it until
-            # the next reap. One non-blocking re-read closes that window; the
-            # cidfile is written at creation, so if a container exists its id
-            # is already on disk.
-            if not container_id:
-                container_id = await _read_cid(cidfile, timeout=0.0)
-            if container_id:
-                await _docker("rm", "--force", container_id)
-            shutil.rmtree(workdir, ignore_errors=True)
+            await _destroy(container_id, cidfile, workdir)
+
+    @classmethod
+    @asynccontextmanager
+    async def session(
+        cls,
+        command: Sequence[str],
+        *,
+        image: Image,
+        limits: Limits,
+        env: Mapping[str, str] | None = None,
+        mounts: Sequence[Mount] = (),
+    ) -> AsyncIterator[SandboxSession]:
+        """Run ``command`` in a container and talk to it while it runs.
+
+        The streaming counterpart of :meth:`run`, for stdio protocol clients.
+        Every containment property is unchanged -- the argv comes from the same
+        :meth:`build_argv`, so a networked runner is refused here exactly as it
+        is there -- and the only difference in the flag list is ``-i``.
+
+        A context manager rather than a plain coroutine because the container
+        must be destroyed on the way out of *any* exit: a raised exception, a
+        cancelled scan, or a clean finish. That teardown is
+        :func:`_destroy`, the same one :meth:`run` uses.
+
+        Read the verdict from :meth:`SandboxSession.result` after the block::
+
+            async with SandboxHandle.session(argv, image=..., limits=...) as s:
+                await s.send(b'{"jsonrpc":"2.0",...}\\n')
+                chunk = await s.read(4096)
+            outcome = s.result().outcome
+        """
+        await _reap_once()
+
+        workdir, cidfile = _make_workdir()
+        argv = cls.build_argv(
+            list(command),
+            image=image,
+            limits=limits,
+            env=env,
+            mounts=mounts,
+            cidfile=cidfile,
+            interactive=True,
+        )
+
+        container_id = ""
+        session: SandboxSession | None = None
+        try:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *argv,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+            except OSError as exc:
+                raise SandboxError(f"could not launch `docker run`: {exc}") from exc
+
+            if proc.stdin is None or proc.stdout is None or proc.stderr is None:
+                proc.kill()
+                await proc.wait()
+                raise SandboxError("docker subprocess was created without pipes")
+
+            session = SandboxSession(proc, limits=limits, cidfile=cidfile)
+            yield session
+        finally:
+            if session is not None:
+                container_id = await session._finish()
+            await _destroy(container_id, cidfile, workdir)

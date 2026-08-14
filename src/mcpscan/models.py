@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from enum import StrEnum
 from pathlib import Path
+from typing import Final
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class TargetKind(StrEnum):
@@ -66,3 +67,67 @@ class Target(BaseModel):
         }[self.kind]()
         env = f"  env: {', '.join(self.env_keys)}" if self.env_keys else ""
         return f"[{self.kind.value}] {self.label}\n    {detail}{env}"
+
+
+#: How much of a hostile payload is worth keeping as evidence. A sample, not the
+#: artefact: the whole point of a cap is that the server does not get to choose
+#: how much memory our report costs.
+RAW_SAMPLE_BYTES: Final = 2048
+
+
+class AnomalyKind(StrEnum):
+    """Something a target did that a well-behaved MCP server would not.
+
+    Not a severity and not a finding -- an observation. Step 4's rule engine
+    decides what any of these are worth; the transport's job is only to notice
+    and to keep enough of the evidence to argue about later.
+    """
+
+    # -- framing (jsonrpc.MessageStream) --------------------------------
+    OVERSIZED_LINE = "oversized_line"
+    NON_JSON_STDOUT = "non_json_stdout"
+    BAD_UTF8 = "bad_utf8"
+    EMBEDDED_NEWLINE = "embedded_newline"
+    JSON_TOO_DEEP = "json_too_deep"
+    BATCH_ARRAY = "batch_array"
+    MISSING_JSONRPC = "missing_jsonrpc"
+    MALFORMED_MESSAGE = "malformed_message"
+    RESULT_AND_ERROR = "result_and_error"
+
+    # -- correlation (jsonrpc.Dispatcher) -------------------------------
+    DUPLICATE_ID = "duplicate_id"
+    UNSOLICITED_RESPONSE = "unsolicited_response"
+    UNEXPECTED_SERVER_REQUEST = "unexpected_server_request"
+
+    # -- protocol semantics (client) ------------------------------------
+    CURSOR_LOOP = "cursor_loop"
+    PAGE_CAP = "page_cap"
+    VERSION_DOWNGRADE = "version_downgrade"
+    UNSUPPORTED_VERSION = "unsupported_version"
+    UNDECLARED_CAPABILITY = "undeclared_capability"
+
+    # -- transport lifecycle --------------------------------------------
+    REQUEST_TIMEOUT = "request_timeout"
+    TRANSPORT_CLOSED = "transport_closed"
+
+
+class ProtocolAnomaly(BaseModel):
+    """One observation, with a bounded sample of what provoked it.
+
+    ``seq`` is arrival order rather than a timestamp. Ordering is the evidence
+    that matters -- "the tool list changed *after* we called it" is a rug pull,
+    the same two listings in the other order are nothing -- and a monotonic
+    counter says that without dragging a clock into a pure module.
+    """
+
+    kind: AnomalyKind
+    detail: str
+    raw: bytes | None = None
+    seq: int = 0
+
+    @field_validator("raw")
+    @classmethod
+    def _truncate(cls, value: bytes | None) -> bytes | None:
+        if value is None:
+            return None
+        return value[:RAW_SAMPLE_BYTES]

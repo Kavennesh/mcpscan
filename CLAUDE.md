@@ -34,18 +34,30 @@ All three must pass before any commit. mypy runs in strict mode; do not add
 - `src/mcpscan/targets.py` -- parses npx commands, URLs, paths, client configs.
 - `src/mcpscan/consent.py` -- one-time authorisation gate.
 - `src/mcpscan/sandbox.py` -- Docker isolation. The only module permitted to
-  spawn processes.
+  spawn processes. `run()` is batch; `session()` is the long-lived duplex form
+  the stdio transport needs. Same flags, same teardown, plus `-i`. Never `--tty`.
+- `src/mcpscan/jsonrpc.py` -- JSON-RPC framing. Pure: no I/O, no clock, no
+  Docker. Every hostile-input decision lives here so CI can test it.
+- `src/mcpscan/transport.py` -- stdio transport. Takes a `SandboxSession` and
+  nothing else; there is no path to a channel the sandbox did not create.
+- `src/mcpscan/client.py` -- MCP client, revision 2025-11-25.
 
 ## Build order -- do not skip ahead
 
 Analysis code does not get written until the sandbox passes its escape tests.
-`tests/test_cli.py::test_scan_refuses_without_sandbox` asserts the scanner
-currently refuses to run. That test is intentional. Do not "fix" it.
+It does now, and steps 2 and 3 are done -- but `cli.py` is still unwired, and
+`tests/test_cli.py::test_scan_refuses_without_sandbox` still asserts that
+`scan` exits 2. That test is intentional. Do not "fix" it; it comes out when
+step 4 gives the CLI something to report.
+
+Step 3 records what a target did wrong as `ProtocolAnomaly`, not `Finding`.
+Mapping anomalies to findings is step 4/5 work, once the rule engine and the
+report formats exist to constrain the shape.
 
 1. [x] CLI and target loader
-2. [ ] Sandbox + escape test suite   <- current
-3. [ ] stdio transport, MCP client
-4. [ ] Static analyser, 3 rules
+2. [x] Sandbox + escape test suite
+3. [x] stdio transport, MCP client
+4. [ ] Static analyser, 3 rules   <- current
 5. [ ] YAML rule engine, JSON report
 6. [ ] Dynamic prober, rug pull detection
 7. [ ] SARIF output
