@@ -24,9 +24,7 @@ to catch the attacks that reading cannot.
 
 </div>
 
-<!-- Save your code-scanning screenshot to docs/images/code-scanning.png and
-     uncomment the line below. It is the most persuasive thing in this file. -->
-<!-- ![mcpscan findings in GitHub code scanning](docs/images/code-scanning.png) -->
+![mcpscan findings in GitHub code scanning](docs/images/code-scanning.png)
 
 ---
 
