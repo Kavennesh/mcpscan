@@ -50,7 +50,15 @@ All three must pass before any commit. mypy runs in strict mode; do not add
   what survives a lone surrogate off the wire and makes a column an offset.
 - `src/mcpscan/source.py` -- `ast` extraction of tool definitions. Per-field line
   ranges point at the *string literal*, not the `def`. Paths are relative to the
-  scan root.
+  scan root. **Two shapes, because MCP has two SDKs**: FastMCP decorates a
+  function per tool, and the low-level SDK returns `Tool(...)` objects from a
+  `@server.list_tools()` function while routing by name in a
+  `@server.call_tool()` dispatcher. `call_tool` is **not** in `TOOL_DECORATORS`
+  and must never go back: it is the router, and counting it as a tool made the
+  official git server report one tool instead of twelve *and* left MCP-003
+  claiming to have run. A `Tool(...)` is attributed to its **nearest enclosing
+  function** -- `ast.walk` is flat, so skipping a nested `FunctionDef` still
+  yields its children and every tool in a nested `list_tools` counts twice.
 - `src/mcpscan/engine.py` -- the pattern-rule engine. `PatternRule`, the three
   closed hook registries, and the per-match regex timeout. **Never widen
   `except TimeoutError` to `except OSError`** -- `TimeoutError` is a subclass of
@@ -63,7 +71,12 @@ All three must pass before any commit. mypy runs in strict mode; do not add
 - `src/mcpscan/rules/*.yaml` -- the bundled pack. MCP-001 and MCP-002.
 - `src/mcpscan/taint.py` -- MCP-003, in code. Taint analysis is not pattern
   matching; do not push it into YAML. Sinks are named as **strings** so
-  constraint 2 holds; no import and no attribute access here.
+  constraint 2 holds; no import and no attribute access here. Follows a call
+  **one hop, same module only** (`MAX_CALL_DEPTH`), because the low-level SDK
+  puts the caller's arguments in the dispatcher and the sink in a handler.
+  Cross-module would need `_finding` reworked first -- the path comes from the
+  entry point, so a cross-file hop reports the callee's line against the
+  caller's file.
 - `src/mcpscan/anomalies.py` -- `AnomalyKind` -> `Finding`. Fifteen kinds map to
   MCP-004/005/006; four are coverage notes, never findings.
 - `src/mcpscan/report.py` -- JSON, `schema_version: 1`. The only clock outside
@@ -143,6 +156,13 @@ directory in the fetcher, mount it read-only, install nothing in the runner.
 `fetch.py` uses `npm install --ignore-scripts`, which departs from the letter of
 `Dockerfile.fetcher` ("fetching uses npm pack") while keeping its stated reason;
 that is a deliberate call, documented in the module, and worth re-reviewing.
+
+**A shape we cannot read is a note, never silence.** A file that parses but
+declares its tools in a form no pattern matches, and a tree with no Python in it
+at all, both produce a `CoverageNote` carried on `SourceTree.notes` beside
+`unparsed`. This is the same argument as everywhere else in the project, and it
+is the bug step 9 existed to fix: a scan of the official git server reported a
+clean bill of health for a file it had read and not understood.
 
 **A SARIF result without a `physicalLocation` is silently discarded**, and the
 upload still reports success. Every finding from a live server carries a JSON

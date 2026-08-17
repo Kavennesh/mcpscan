@@ -273,3 +273,142 @@ def test_fixtures_parse(tmp_path: Path, fixture: str) -> None:
     result = analyse(Subject.from_path(root), default_rules())
     assert result.unparsed == []
     assert result.files_scanned == 1
+
+
+# --------------------------------------------------------------------------
+# the low-level SDK: taint crossing the dispatcher
+# --------------------------------------------------------------------------
+def dispatcher_tree(source: str) -> SourceTree:
+    return SourceTree(root=Path("."), modules={Path("s.py"): ast.parse(source)})
+
+
+CROSSING = """
+import subprocess
+
+def archive(directory):
+    return subprocess.check_output(f"tar -cf out.tar {directory}", shell=True)
+
+@server.call_tool()
+async def call_tool(name, arguments):
+    return archive(arguments["directory"])
+"""
+
+
+def test_taint_crosses_the_dispatcher() -> None:
+    """The whole point of step 9.
+
+    The low-level SDK splits a tool in two: the dispatcher reads the caller's
+    arguments, a handler does the work. Stopping at the dispatcher meant MCP-003
+    found nothing on any server built that way, while reporting that it ran.
+    """
+    findings = list(RULE.check(dispatcher_tree(CROSSING), []))
+    assert len(findings) == 1
+    assert findings[0].severity is Severity.CRITICAL
+    assert findings[0].metadata["sink"] == "subprocess.check_output"
+    assert "subprocess.check_output" in (findings[0].evidence or "")
+
+
+def test_the_finding_points_at_the_sink_and_back_at_the_dispatcher() -> None:
+    """Still two-place: the sink is where the bug is, the entry point is why."""
+    finding = list(RULE.check(dispatcher_tree(CROSSING), []))[0]
+    assert finding.location.start_line == 5      # the subprocess call
+    assert finding.related[0].start_line == 8    # the dispatcher's def
+
+
+def test_a_dispatcher_finding_does_not_call_the_router_a_tool() -> None:
+    """`call_tool` handles every tool and is none of them; naming it one is the
+    confusion this step exists to remove."""
+    finding = list(RULE.check(dispatcher_tree(CROSSING), []))[0]
+    assert "dispatcher" in finding.message
+    assert "of tool" not in finding.message
+
+
+def test_an_allowlist_in_the_handler_still_clears_taint() -> None:
+    """The control that proves the crossing is not simply firing on everything."""
+    source = """
+ALLOWED = {"a": "first"}
+
+def lookup(record_id):
+    return ALLOWED.get(record_id, "unknown")
+
+@server.call_tool()
+async def call_tool(name, arguments):
+    return lookup(arguments["record_id"])
+"""
+    assert list(RULE.check(dispatcher_tree(source), [])) == []
+
+
+def test_a_clean_handler_reports_nothing() -> None:
+    source = """
+import subprocess
+
+def status(repo):
+    return subprocess.check_output(["git", "status"], cwd=repo)
+
+@server.call_tool()
+async def call_tool(name, arguments):
+    return status("/srv/repo")
+"""
+    assert list(RULE.check(dispatcher_tree(source), [])) == []
+
+
+def test_only_one_hop_is_followed() -> None:
+    """Depth is a judgement about the shape servers take, not a principle, and
+    it is stated in the module docstring and on the rule page rather than left
+    to be discovered from a false negative."""
+    source = """
+import subprocess
+
+def inner(value):
+    return subprocess.check_output(value, shell=True)
+
+def outer(value):
+    return inner(value)
+
+@server.call_tool()
+async def call_tool(name, arguments):
+    return outer(arguments["cmd"])
+"""
+    assert list(RULE.check(dispatcher_tree(source), [])) == []
+
+
+def test_a_recursive_handler_terminates() -> None:
+    source = """
+import subprocess
+
+def recurse(value):
+    if value:
+        return recurse(value)
+    return subprocess.check_output(value, shell=True)
+
+@server.call_tool()
+async def call_tool(name, arguments):
+    return recurse(arguments["cmd"])
+"""
+    list(RULE.check(dispatcher_tree(source), []))  # must not hang or recurse away
+
+
+def test_a_declared_tool_has_nothing_to_analyse() -> None:
+    """It has metadata and no body; its handler is reached through the router."""
+    tool = SourceTool(name="declared", path=Path("s.py"), func=None)
+    assert analyse_tool(tool) == []
+
+
+def test_the_dispatcher_fixture_reports_exactly_one_command_injection(
+    tmp_path: Path,
+) -> None:
+    root = materialise(tmp_path, "dispatcher_server")
+    result = analyse(Subject.from_path(root, label="fx"), default_rules())
+
+    injections = [f for f in result.findings if f.rule_id == "MCP-003"]
+    assert len(injections) == 1
+    assert injections[0].severity is Severity.CRITICAL
+    assert "MCP-003" in result.ran, "the rule must report that it actually ran"
+
+
+def test_the_dispatcher_fixture_exposes_its_declared_tools(tmp_path: Path) -> None:
+    """Before step 9 this tree yielded one "tool" called `call_tool`."""
+    root = materialise(tmp_path, "dispatcher_server")
+    subject = Subject.from_path(root, label="fx")
+    assert {t.name for t in subject.tools} == {"archive_directory", "lookup_record"}
+    assert all(t.description for t in subject.tools)

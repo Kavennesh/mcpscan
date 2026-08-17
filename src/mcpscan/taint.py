@@ -22,8 +22,15 @@ same distinction the containment suite already draws in its own
 
 Limits, stated here rather than discovered from a false negative later:
 
-*Intraprocedural.* A parameter handed to a helper that calls the sink is not
-followed. This is the largest gap and the obvious next increment.
+*One call deep, and only within a module.* The low-level SDK splits a tool in
+two -- a dispatcher reads ``arguments["repo_path"]`` and hands it to a handler
+that does the work -- so stopping at the dispatcher missed MCP-003 entirely on
+every server built that way. A call to a function defined in the same file is
+followed once, with the tainted arguments bound to its parameters. A handler that
+delegates again is not followed, and neither is one imported from another module:
+a finding's path comes from the tool, so a cross-file hop would report the
+callee's line against the caller's file. Both limits are judgements about the
+shapes servers actually take, not principles.
 
 *Path-insensitive.* Statements are visited in order with no branch modelling, so
 a guard like ``if path not in ALLOWED: raise`` does not clear taint. A correctly
@@ -38,14 +45,21 @@ of it.
 from __future__ import annotations
 
 import ast
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
 from mcpscan.engine import RuleMeta
 from mcpscan.models import Confidence, Finding, Location, Severity
-from mcpscan.source import SourceTool, SourceTree, dotted_name
+from mcpscan.source import (
+    FunctionDef,
+    SourceTool,
+    SourceTree,
+    dispatchers,
+    dotted_name,
+    relative_to_root,
+)
 
 #: Dotted names that execute a command. Strings, never attribute access -- see
 #: the module docstring.
@@ -118,6 +132,13 @@ _PROPAGATING_METHODS: Final = frozenset(
 _LOOKUP_METHODS: Final = frozenset({"get", "setdefault"})
 
 
+#: How many calls deep taint is followed. One: dispatcher -> handler is the
+#: shape the low-level SDK produces, and a handler that delegates again is
+#: missed. A judgement, not a principle -- stated here and on the rule page
+#: rather than left for a reader to infer from behaviour.
+MAX_CALL_DEPTH: Final = 1
+
+
 @dataclass(frozen=True, slots=True)
 class TaintHit:
     """One tainted value reaching one sink."""
@@ -130,14 +151,27 @@ class TaintHit:
 
 
 class _TaintScope:
-    """Forward taint within a single function body."""
+    """Forward taint within a single function body, and one call beyond it."""
 
-    __slots__ = ("hits", "tainted")
+    __slots__ = ("depth", "hits", "callees", "tainted", "visiting")
 
-    def __init__(self, parameters: Sequence[str]) -> None:
+    def __init__(
+        self,
+        parameters: Sequence[str],
+        callees: Mapping[str, FunctionDef] | None = None,
+        depth: int = 0,
+        visiting: frozenset[str] = frozenset(),
+    ) -> None:
         #: variable name -> the originating parameter, so a finding can say which.
         self.tainted: dict[str, str] = {name: name for name in parameters}
         self.hits: list[TaintHit] = []
+        #: Functions defined in the same module, by name. Same module only: a
+        #: finding's path comes from the tool, so following a call into another
+        #: file would report the callee's line number against the caller's file.
+        self.callees: Mapping[str, FunctionDef] = callees or {}
+        self.depth = depth
+        #: Names already on the stack, so a recursive handler cannot loop.
+        self.visiting = visiting
 
     # -- taint of an expression -----------------------------------------
     def origin(self, node: ast.expr | None) -> str | None:
@@ -284,6 +318,68 @@ class _TaintScope:
             origin = self.origin(path_arg)
             if origin is not None:
                 self.hits.append(TaintHit(name, origin, node, shell=False, kind="path"))
+            return
+
+        self._follow(name, node)
+
+    def _follow(self, name: str, node: ast.Call) -> None:
+        """Step into a same-module callee, once, carrying the taint with us.
+
+        The low-level SDK splits a tool in two: a dispatcher reads
+        ``arguments["repo_path"]`` and hands it to a handler that does the work.
+        Intraprocedural analysis sees a tainted value go into a call it does not
+        recognise as a sink and stops, which is the whole of MCP-003 missing on
+        every server built that way.
+
+        One hop, and only within the module. Depth is a judgement rather than a
+        principle -- it is the shape the SDK produces -- and the limit is written
+        down in the module docstring and on the rule's page rather than implied.
+        """
+        if self.depth >= MAX_CALL_DEPTH:
+            return
+        callee = self.callees.get(name.rsplit(".", 1)[-1])
+        if callee is None or callee.name in self.visiting:
+            return
+
+        bound = self._bindings(callee, node)
+        if not bound:
+            return
+
+        inner = _TaintScope(
+            (),
+            callees=self.callees,
+            depth=self.depth + 1,
+            visiting=self.visiting | {callee.name},
+        )
+        inner.tainted.update(bound)
+        inner.visit_body(callee.body)
+        self.hits.extend(inner.hits)
+
+    def _bindings(self, callee: FunctionDef, node: ast.Call) -> dict[str, str]:
+        """Which of the callee's parameters receive a tainted argument.
+
+        Positional by position and keyword by name, so the reported parameter
+        stays the *caller's* -- a finding that named the handler's local
+        parameter would lose the fact that the value came from the wire.
+        """
+        args = callee.args
+        names = [a.arg for a in (*args.posonlyargs, *args.args)]
+        bound: dict[str, str] = {}
+
+        for index, argument in enumerate(node.args):
+            origin = self.origin(argument)
+            if origin is not None and index < len(names):
+                bound[names[index]] = origin
+
+        keyword_names = {a.arg for a in args.kwonlyargs} | set(names)
+        for keyword in node.keywords:
+            if keyword.arg is None or keyword.arg not in keyword_names:
+                continue
+            origin = self.origin(keyword.value)
+            if origin is not None:
+                bound[keyword.arg] = origin
+
+        return bound
 
 
 def _is_shell(node: ast.Call) -> bool:
@@ -334,9 +430,30 @@ def _nested_bodies(node: ast.stmt) -> Iterator[list[ast.stmt]]:
                 yield handler.body
 
 
-def analyse_tool(tool: SourceTool) -> list[TaintHit]:
+def module_functions(module: ast.Module) -> dict[str, FunctionDef]:
+    """Top-level and class-level functions by name, for one-hop call following.
+
+    Names collide across classes; the first definition wins, which is the same
+    over-approximation `extract_by_name` already makes. Following the wrong
+    same-named function in the same file is a false positive we accept over
+    following none of them.
+    """
+    found: dict[str, FunctionDef] = {}
+    for node in ast.walk(module):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            found.setdefault(node.name, node)
+    return found
+
+
+def analyse_tool(
+    tool: SourceTool, callees: Mapping[str, FunctionDef] | None = None
+) -> list[TaintHit]:
     """Every tainted parameter reaching a sink inside one tool function."""
-    scope = _TaintScope(tool.parameters)
+    if tool.func is None:
+        # A declared `Tool(...)` has metadata and no body. Its handler is reached
+        # through the dispatcher, which is analysed as its own entry point.
+        return []
+    scope = _TaintScope(tool.parameters, callees=callees)
     scope.visit_body(tool.func.body)
     return scope.hits
 
@@ -368,11 +485,24 @@ class UnsanitisedSinkRule:
     )
 
     def check(self, tree: SourceTree, tools: Sequence[SourceTool]) -> Iterator[Finding]:
-        for tool in tools:
-            for hit in analyse_tool(tool):
-                yield self._finding(tree, tool, hit)
+        # Functions by file, so a call can be followed one hop without leaving
+        # the module. Built once per tree rather than per tool.
+        index: dict[Path, dict[str, FunctionDef]] = {
+            relative_to_root(path, tree.root): module_functions(module)
+            for path, module in tree.modules.items()
+        }
 
-    def _finding(self, tree: SourceTree, tool: SourceTool, hit: TaintHit) -> Finding:
+        # The dispatcher is not a tool, and it is where a caller's arguments
+        # enter a low-level SDK server. Analysing only `tools` meant every such
+        # server was examined at exactly the wrong function.
+        subjects = [*((t, False) for t in tools), *((d, True) for d in dispatchers(tree))]
+        for tool, routes in subjects:
+            for hit in analyse_tool(tool, index.get(tool.path)):
+                yield self._finding(tree, tool, hit, routes=routes)
+
+    def _finding(
+        self, tree: SourceTree, tool: SourceTool, hit: TaintHit, *, routes: bool = False
+    ) -> Finding:
         severity, confidence = _rank(hit)
         path = _relative(tool.path, tree.root)
         location = Location(
@@ -380,20 +510,27 @@ class UnsanitisedSinkRule:
             start_line=hit.node.lineno,
             end_line=hit.node.end_lineno or hit.node.lineno,
         )
+        # `func` is never None here: a tool without one produces no hits.
+        declared_at = tool.func.lineno if tool.func is not None else hit.node.lineno
         parameter = Location(
             path=path,
-            start_line=tool.func.lineno,
-            end_line=tool.func.lineno,
+            start_line=declared_at,
+            end_line=declared_at,
         )
 
         shell = " with shell=True" if hit.shell else ""
+        # Naming the router a "tool" is the exact confusion this rule had to be
+        # taught out of: `call_tool` handles every tool and is none of them.
+        subject = (
+            f"the {tool.name!r} dispatcher" if routes else f"tool {tool.name!r}"
+        )
         return Finding(
             rule_id=self.meta.id,
             title=self.meta.title,
             severity=severity,
             confidence=confidence,
             message=(
-                f"Parameter {hit.parameter!r} of tool {tool.name!r} reaches "
+                f"Parameter {hit.parameter!r} of {subject} reaches "
                 f"{hit.sink}(){shell} without sanitisation."
             ),
             location=location,

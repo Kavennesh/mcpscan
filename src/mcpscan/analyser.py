@@ -24,7 +24,14 @@ from mcpscan.document import MetadataDocument
 from mcpscan.engine import CoverageNote, RuleSet, ScanState
 from mcpscan.models import Finding
 from mcpscan.ruleloader import load_all
-from mcpscan.source import SourceTool, SourceTree, extract_by_name, extract_tools, load_tree
+from mcpscan.source import (
+    SourceTool,
+    SourceTree,
+    dispatchers,
+    extract_by_name,
+    extract_tools,
+    load_tree,
+)
 from mcpscan.taint import UnsanitisedSinkRule
 
 
@@ -135,8 +142,22 @@ def analyse(
         if subject.tree is None:
             skipped.append((source_rule.meta.id, "no source available"))
             continue
-        if not subject.tools:
-            skipped.append((source_rule.meta.id, "no tool definitions found in source"))
+        # A tool with no function body -- a `Tool(...)` declaration -- is nothing
+        # for taint to analyse, and a dispatcher is something to analyse that is
+        # not a tool. Asking "are there tools?" answered neither question: a
+        # low-level SDK server reported MCP-003 as having run because its router
+        # had been miscounted as a tool.
+        analysable = [tool for tool in subject.tools if tool.func is not None]
+        routers = dispatchers(subject.tree)
+        if not analysable and not routers:
+            skipped.append(
+                (
+                    source_rule.meta.id,
+                    "no tool implementations found in source"
+                    if subject.tools
+                    else "no tool definitions found in source",
+                )
+            )
             continue
         ran.append(source_rule.meta.id)
         findings.extend(source_rule.check(subject.tree, subject.tools))
@@ -146,6 +167,7 @@ def analyse(
             finding.subject = subject.label
 
     findings.sort(key=lambda f: f.sort_key)
+    tree_notes = list(subject.tree.notes) if subject.tree else []
 
     return AnalysisResult(
         findings=findings,
@@ -153,5 +175,10 @@ def analyse(
         unparsed=list(subject.tree.unparsed) if subject.tree else [],
         ran=ran,
         skipped=skipped,
-        notes=list(state.notes),
+        # Tree notes first: what the scan could not *read* precedes what the
+        # rules could not do with what it read.
+        notes=[
+            *(CoverageNote(kind=kind, detail=detail) for kind, detail in tree_notes),
+            *state.notes,
+        ],
     )

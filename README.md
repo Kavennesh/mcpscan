@@ -100,6 +100,12 @@ the vulnerability.
 Findings carry a file and line where source exists, a JSON pointer where only a
 live server does, and both when both.
 
+Both Python SDKs are read: FastMCP's `@mcp.tool()` functions, and the low-level
+SDK's `Tool(...)` declarations with their `@server.call_tool()` dispatcher. Taint
+follows one call from a dispatcher into a handler in the same file, which is
+where the low-level SDK puts the sink. mcpscan reads **Python only** — a tree
+written in TypeScript says so rather than reporting nothing found.
+
 Nothing shrinks silently: when a budget or a cap stops a probe, the scan says so.
 "No findings" and "did not look" are different results and are reported as such.
 

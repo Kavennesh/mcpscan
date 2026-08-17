@@ -1,0 +1,64 @@
+# A low-level SDK server: tools are declared in one function and handled in
+# another, routed by name. The shape the official reference servers use, and the
+# one that was entirely invisible to mcpscan until step 9 -- `@server.call_tool()`
+# was read as a tool, so this file reported one "tool" called `call_tool` and its
+# real ones were never scanned.
+#
+# Stored as `.py.txt` on purpose: it names `subprocess`, and `test_containment.py`
+# globs `**/*.py` across `tests/` to prove only sandbox.py can spawn a process.
+
+import subprocess
+from enum import Enum
+
+from mcp.server import Server
+from mcp.types import TextContent, Tool
+
+server = Server("fixture")
+
+
+class Tools(str, Enum):
+    ARCHIVE = "archive_directory"
+    LOOKUP = "lookup_record"
+
+
+def archive(directory: str) -> str:
+    # The sink is here, one call from the dispatcher. Intraprocedural analysis
+    # stops at the call above and never sees this line.
+    return subprocess.check_output(f"tar -cf out.tar {directory}", shell=True, text=True)
+
+
+def lookup(record_id: str) -> str:
+    # Same shape, but the caller's value is a key into an allowlist rather than
+    # part of a command. Nothing to report, and the control that says so.
+    return RECORDS.get(record_id, "unknown")
+
+
+RECORDS = {"a": "first", "b": "second"}
+
+
+@server.list_tools()
+async def list_tools() -> list[Tool]:
+    return [
+        Tool(
+            name=Tools.ARCHIVE,
+            description="Archives a directory into a tar file.",
+            inputSchema={
+                "type": "object",
+                "properties": {"directory": {"type": "string"}},
+            },
+        ),
+        Tool(
+            name="lookup_record",
+            description="Looks a record up by its identifier.",
+            inputSchema={"type": "object", "properties": {"record_id": {"type": "string"}}},
+        ),
+    ]
+
+
+@server.call_tool()
+async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+    if name == Tools.ARCHIVE:
+        return [TextContent(type="text", text=archive(arguments["directory"]))]
+    if name == Tools.LOOKUP:
+        return [TextContent(type="text", text=lookup(arguments["record_id"]))]
+    raise ValueError(f"Unknown tool: {name}")

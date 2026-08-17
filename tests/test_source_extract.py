@@ -15,6 +15,7 @@ import pytest
 
 from mcpscan.source import (
     SourceTree,
+    dispatchers,
     extract_by_name,
     extract_tools,
     load_tree,
@@ -23,10 +24,12 @@ from mcpscan.source import (
 from tests.sourcefixtures import materialise
 
 
+def tree_of(source: str) -> SourceTree:
+    return SourceTree(root=Path("."), modules={Path("s.py"): ast.parse(source)})
+
+
 def tools_from(source: str) -> list:
-    module = ast.parse(source)
-    tree = SourceTree(root=Path("."), modules={Path("s.py"): module})
-    return extract_tools(tree)
+    return extract_tools(tree_of(source))
 
 
 # --------------------------------------------------------------------------
@@ -39,7 +42,6 @@ def tools_from(source: str) -> list:
         "@mcp.tool",
         "@server.tool()",
         "@app.tool(name='x')",
-        "@app.call_tool()",
         "@tool",
         "@tool()",
         "@self.mcp.tool()",
@@ -48,6 +50,21 @@ def tools_from(source: str) -> list:
 def test_tool_decorator_forms_are_recognised(decorator: str) -> None:
     tools = tools_from(f"{decorator}\ndef search(q: str):\n    'Searches.'\n")
     assert len(tools) == 1, decorator
+
+
+def test_a_dispatcher_is_not_a_tool() -> None:
+    """`@app.call_tool()` was in TOOL_DECORATORS and had to come out.
+
+    In the low-level SDK it decorates the *router* -- one function that handles
+    every tool by name. Counting it as a tool meant the official git server
+    reported exactly one tool called `call_tool` while its twelve real ones were
+    invisible, and, worse, left `subject.tools` non-empty so MCP-003 reported as
+    having run over a file it had not understood. It is still analysed, as a
+    taint entry point; it is just not a tool.
+    """
+    source = "@app.call_tool()\nasync def call_tool(name: str, arguments: dict):\n    ...\n"
+    assert tools_from(source) == []
+    assert [d.name for d in dispatchers(tree_of(source))] == ["call_tool"]
 
 
 def test_an_unrelated_decorator_is_not_a_tool() -> None:
@@ -222,3 +239,145 @@ def test_the_poisoned_fixture_line_ranges_land_on_the_strings(tmp_path: Path) ->
 
     start, _ = tools["list_files"].field_lines["description"]
     assert "description=" in text[start - 1]
+
+
+# --------------------------------------------------------------------------
+# the low-level SDK: tools declared as objects, not decorated functions
+# --------------------------------------------------------------------------
+DECLARED = """
+from enum import Enum
+
+class Tools(str, Enum):
+    STATUS = "git_status"
+
+@server.list_tools()
+async def list_tools():
+    return [
+        Tool(
+            name=Tools.STATUS,
+            description="Shows the working tree status.",
+            inputSchema={"type": "object"},
+        ),
+        types.Tool(
+            name="fetch",
+            description="Fetches a URL.",
+        ),
+    ]
+"""
+
+
+def test_declared_tools_are_found() -> None:
+    """`Tool(...)` returned from a function is a tool declaration.
+
+    The official git, fetch and time servers declare every tool this way, and
+    until this existed a scan of them saw one router and nothing else.
+    """
+    tools = {t.name: t for t in tools_from(DECLARED)}
+    assert set(tools) == {"git_status", "fetch"}
+    assert tools["git_status"].description == "Shows the working tree status."
+    assert tools["fetch"].description == "Fetches a URL."
+
+
+def test_a_dotted_tool_class_counts() -> None:
+    """`types.Tool(...)` is the same declaration; only the last segment matters,
+    exactly as decorator matching already works."""
+    assert [t.name for t in tools_from(DECLARED)][1] == "fetch"
+
+
+def test_a_declared_tool_has_no_function() -> None:
+    """Its handler is reached by name through the dispatcher at runtime, so
+    there is no body to attribute and nothing for taint to walk."""
+    tool = tools_from(DECLARED)[0]
+    assert tool.func is None
+    assert tool.parameters == []
+
+
+def test_a_name_is_resolved_through_a_str_enum() -> None:
+    """`name=GitTools.STATUS` is how the reference servers name their tools."""
+    tool = tools_from(DECLARED)[0]
+    assert tool.name == "git_status"
+    assert tool.name_resolved is True
+
+
+def test_an_enum_value_attribute_resolves_too() -> None:
+    source = DECLARED.replace("name=Tools.STATUS", "name=Tools.STATUS.value")
+    assert tools_from(source)[0].name == "git_status"
+
+
+def test_an_unresolvable_name_keeps_the_tool() -> None:
+    """`name=self.name` cannot be read, and the description still can. Dropping
+    a real tool for want of a label loses the part the rules actually scan."""
+    source = """
+class Handler:
+    def get_tool_description(self):
+        return Tool(name=self.name, description="Lists files in the vault.")
+"""
+    tool = tools_from(source)[0]
+    assert tool.description == "Lists files in the vault."
+    assert tool.name_resolved is False
+    assert "name" not in tool.field_lines
+
+
+def test_declaration_line_ranges_point_at_the_literal() -> None:
+    tool = tools_from(DECLARED)[0]
+    start, end = tool.field_lines["description"]
+    assert DECLARED.splitlines()[start - 1].strip().startswith("description=")
+    assert start == end
+
+
+def test_a_tool_in_a_nested_function_is_counted_once() -> None:
+    """`ast.walk` is flat: skipping a nested FunctionDef still yields its
+    children, so a `list_tools` nested inside `serve()` was attributed to both
+    and every tool counted twice. The reference servers all nest exactly so."""
+    source = """
+def serve():
+    @server.list_tools()
+    async def list_tools():
+        return [Tool(name="only", description="Once.")]
+"""
+    assert [t.name for t in tools_from(source)] == ["only"]
+
+
+def test_a_tool_built_but_not_returned_is_not_a_declaration() -> None:
+    """A `Tool(...)` assigned to a local is not a server's tool surface. The
+    return statement is what makes the function's job unambiguous."""
+    source = "def helper():\n    candidate = Tool(name='x', description='Nope.')\n"
+    assert tools_from(source) == []
+
+
+def test_an_unreadable_declaration_shape_is_a_note_not_silence() -> None:
+    """snowflake builds its tools in a comprehension over runtime objects. We
+    cannot read that, and saying nothing would report a clean scan of a file we
+    looked straight at."""
+    source = """
+@server.list_tools()
+async def handle_list_tools():
+    return [types.Tool(name=t.name, description=t.description) for t in allowed]
+"""
+    tree = tree_of(source)
+    assert extract_tools(tree) == []
+    assert [kind for kind, _ in tree.notes] == ["unreadable_tool_shape"]
+
+
+def test_a_tree_with_no_python_says_which_language_it_held(tmp_path: Path) -> None:
+    """Four corpus repositories are TypeScript. A scan of one reported that the
+    metadata rules ran and found nothing, which reads as a clean bill of health
+    for a directory the analyser never opened."""
+    root = tmp_path / "target"
+    (root / "src").mkdir(parents=True)
+    (root / "src" / "index.ts").write_text("export const x = 1;\n")
+    (root / "src" / "cli.js").write_text("module.exports = {};\n")
+
+    tree = load_tree(root)
+    assert tree.file_count == 0
+    kinds = [kind for kind, _ in tree.notes]
+    assert kinds == ["unread_language"]
+    assert ".ts" in tree.notes[0][1] and ".js" in tree.notes[0][1]
+
+
+def test_a_python_tree_gets_no_language_note(tmp_path: Path) -> None:
+    root = tmp_path / "target"
+    root.mkdir()
+    (root / "server.py").write_text("x = 1\n")
+    (root / "helper.ts").write_text("export const x = 1;\n")
+    assert load_tree(root).notes == []
