@@ -272,7 +272,7 @@ def test_exit_codes_are_identical_across_formats(tmp_path: Path) -> None:
     """The format changes what is printed, never what the exit code means."""
     for fixture, expected in [("clean_server", EXIT_OK), ("vulnerable_server", EXIT_FINDINGS)]:
         root = materialise(tmp_path / fixture, fixture)
-        for fmt in ("text", "json", "sarif"):
+        for fmt in ("text", "json", "sarif", "html"):
             # Inside tmp_path: a SARIF run writes its artefacts relative to the
             # working directory, and a test suite should not litter the repo.
             with working_directory(tmp_path):
@@ -414,6 +414,54 @@ def test_the_artefact_follows_the_workspace_not_the_output_flag(tmp_path: Path) 
         for e in payload["runs"][0]["results"]
     }
     assert any(uri.startswith(".mcpscan/") for uri in uris)
+
+
+def test_html_output_is_a_self_contained_document(tmp_path: Path) -> None:
+    root = materialise(tmp_path, "poisoned_metadata")
+    with working_directory(tmp_path):
+        result = CliRunner().invoke(
+            app,
+            ["scan", "--path", str(root), "--format", "html", "--yes-i-am-authorised"],
+        )
+    assert result.exit_code == EXIT_FINDINGS, result.output
+    assert result.stdout.lstrip().startswith("<!doctype html>")
+    assert "<style>" in result.stdout
+    # The whole claim of the format: nothing is fetched when it is opened.
+    for forbidden in ("<script", "<link", "@import", "url(http"):
+        assert forbidden not in result.stdout.lower()
+
+
+def test_html_output_flag_writes_a_file(tmp_path: Path) -> None:
+    root = materialise(tmp_path, "vulnerable_server")
+    destination = tmp_path / "report.html"
+    with working_directory(tmp_path):
+        result = CliRunner().invoke(
+            app,
+            [
+                "scan", "--path", str(root),
+                "--format", "html", "--output", str(destination),
+                "--yes-i-am-authorised",
+            ],
+        )
+    assert result.exit_code == EXIT_FINDINGS
+    assert "MCP-003" in destination.read_text(encoding="utf-8")
+
+
+def test_an_unwritable_output_is_a_scanner_error_not_a_finding(tmp_path: Path) -> None:
+    """It exited 1 with an uncaught traceback, because the write sat outside the
+    try that claimed to cover it. A pipeline reads 1 as "findings at or above
+    --fail-on" and ships the vulnerability.
+    """
+    root = materialise(tmp_path, "clean_server")
+    result = CliRunner().invoke(
+        app,
+        [
+            "scan", "--path", str(root),
+            "--output", str(tmp_path / "no-such-dir" / "report.txt"),
+            "--yes-i-am-authorised",
+        ],
+    )
+    assert result.exit_code == EXIT_ERROR, result.output
 
 
 def test_a_url_target_still_refuses_in_sarif(tmp_path: Path) -> None:

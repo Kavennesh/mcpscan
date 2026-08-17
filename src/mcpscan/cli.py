@@ -8,7 +8,7 @@ from typing import Annotated, Final
 
 import typer
 
-from mcpscan import __version__, report, sarif
+from mcpscan import __version__, htmlreport, report, sarif
 from mcpscan import targets as tgt
 from mcpscan.analyser import AnalysisResult, default_rules
 from mcpscan.consent import ensure_consent
@@ -33,6 +33,7 @@ class ReportFormat(StrEnum):
     TEXT = "text"
     JSON = "json"
     SARIF = "sarif"
+    HTML = "html"
 
 
 class VerifyFormat(StrEnum):
@@ -224,17 +225,22 @@ def scan(
 
     try:
         rendered = _render(run, format, fail_on=fail_on, rules=ruleset)
-    except OSError as exc:
+        if output is not None:
+            output.write_text(rendered, encoding="utf-8")
+        else:
+            typer.echo(rendered, nl=False)
+    except (OSError, UnicodeError) as exc:
         # A SARIF run writes the artefacts its results point at. Failing to write
         # part of the output that was asked for is a scanner error, exactly as an
         # unwritable --output is.
+        #
+        # The write is *inside* the try, which it was not: an unwritable
+        # --output raised straight out of the command and exited 1, which a
+        # pipeline reads as "findings at or above --fail-on". `UnicodeError` is
+        # here for the same reason -- a hostile server can put a lone surrogate
+        # in a description, and `--format json` still cannot encode one.
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(EXIT_ERROR) from exc
-
-    if output is not None:
-        output.write_text(rendered, encoding="utf-8")
-    else:
-        typer.echo(rendered, nl=False)
 
     if run.errors:
         # A target that could not be scanned is a scanner error, never a finding.
@@ -246,6 +252,19 @@ def scan(
 def _render(run: ScanRun, format: ReportFormat, *, fail_on: Severity, rules: RuleSet) -> str:
     if format is ReportFormat.JSON:
         return report.render(run.results, fail_on=fail_on)
+    if format is ReportFormat.HTML:
+        return htmlreport.render(
+            run.results,
+            rules=rules,
+            fail_on=fail_on,
+            surveys=run.surveys,
+            # Errors go to stderr for every other format, which is fine when the
+            # report is one of two streams a caller is watching. Here the file is
+            # the whole artefact: a server that failed its handshake yields a
+            # target with no findings and nothing skipped, and without this the
+            # page would say "no findings" about a server nothing ever examined.
+            errors=run.errors,
+        )
     if format is ReportFormat.SARIF:
         # The repository root, not the working directory -- see `workspace_root`.
         workspace = sarif.workspace_root()

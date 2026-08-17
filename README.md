@@ -52,8 +52,9 @@ mcpscan rules list                         # what would run
 mcpscan rules lint                         # advisory regex warnings
 ```
 
-Three output formats: `--format text` for a human, `--format json` for a script,
-`--format sarif` for a code-scanning tab. See [CI](#ci).
+Four output formats: `--format text` for a human at a terminal, `--format json`
+for a script, `--format sarif` for a code-scanning tab, and `--format html` for
+the report you attach to a ticket. See [CI](#ci) and [The HTML report](#the-html-report).
 
 A `--stdio` scan launches the server in the sandbox and asks the questions only a
 running server can answer: does its tool list change after you trust it, will its
@@ -181,6 +182,39 @@ pull request, and uploads the result. It tolerates exit 1, because finding thing
 in those fixtures is the expected outcome; a workflow scanning a server you
 maintain wants `test $code -eq 0` instead.
 
+## The HTML report
+
+`--format html` writes one file with everything in it. No CDN, no external font,
+no image, no JavaScript at all -- a security tool whose report phones a third
+party when you open it is the first thing anyone will point at. A
+`Content-Security-Policy` meta tag says so in a way the browser enforces rather
+than only the test suite.
+
+```bash
+mcpscan scan --path . --format html --output report.html --yes-i-am-authorised
+```
+
+It shows the summary, every finding with its evidence and remediation, and the
+coverage block -- which rules ran, which did not and why -- because "found
+nothing" and "looked at nothing" are different results.
+
+Two things it does that a terminal cannot:
+
+**MCP-001's evidence is invisible by definition.** A bidi override or a
+zero-width space renders as nothing in a terminal, and worse than nothing in a
+browser: a raw U+202E reorders the text around it, so a description can
+rearrange how a finding reads. Every invisible character is replaced with a
+badge naming it -- `U+202E RIGHT-TO-LEFT OVERRIDE` -- shown in place inside the
+field it was hiding in. Characters that are doing the job they exist for, like
+the ZWJ in a family emoji or the ZWNJ in Persian, are left alone.
+
+**A rug pull is a diff**, so MCP-007 renders as one.
+
+Everything a scanned server controls is attacker-supplied text going into
+markup, so escaping is a security property here and is tested as one: a fixture
+carrying a script tag and an event-handler attribute must render inert, and the
+test parses the output rather than searching it for strings.
+
 ## Isolation model
 
 Every target runs under Docker with no network, a read-only root filesystem, a
@@ -211,8 +245,8 @@ one-time acknowledgement before its first run.
 - [x] Dynamic prober: rug pull, scope escape, env leakage
 - [x] `.mcpscan.lock` and `mcpscan verify`
 - [x] SARIF output for CI
+- [x] HTML report
 - [ ] Streamable HTTP transport (`--url`)
-- [ ] HTML report
 
 ## Licence
 

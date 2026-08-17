@@ -38,7 +38,12 @@ build-backend = "uv_build"
 [tool.uv.build-backend]
 # The bundled rule pack is data, not code, so it needs saying explicitly or an
 # installed mcpscan has an empty rule set and reports every target as clean.
-source-include = ["src/mcpscan/rules/*.yaml"]
+source-include = [
+    "src/mcpscan/rules/*.yaml",
+    # Same argument for the HTML report's template: data, not code. Without
+    # this, `--format html` raises on every invocation of an installed wheel.
+    "src/mcpscan/templates/*.j2",
+]
 
 [dependency-groups]
 dev = [

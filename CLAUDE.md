@@ -84,6 +84,17 @@ All three must pass before any commit. mypy runs in strict mode; do not add
   reported `s.py` sends GitHub looking for a file at the top of the repo.
   A finding with a `path` anchors at its source file; the artefact is only ever
   the fallback, since an alert reads better on a committed file.
+- `src/mcpscan/htmlreport.py` -- `--format html`. One self-contained file: CSS
+  inline, **no JavaScript at all**, no external reference of any kind, and a CSP
+  meta tag so the browser enforces that rather than only a test. Two rules keep
+  it safe: jinja2's `autoescape` is **on** (it defaults to off), and **no markup
+  is ever built in Python** -- interleaving text with badges is done by handing
+  the template `Segment` objects, because a string marked safe is a string
+  autoescape has stopped protecting. Every attacker string goes through
+  `segments()`, which badges invisible characters: a raw U+202E does not render
+  as nothing, it *reorders the report text around it*.
+- `src/mcpscan/templates/report.html.j2` -- the only markup in the project. Never
+  interpolate into `<style>`; always quote an attribute.
 - `src/mcpscan/analyser.py` -- runs the rules and reports what it could not run.
 - `src/mcpscan/canary.py` -- planted secrets. Decoy files mounted read-only at
   `/home/canary`, env values generated per scan from `Target.env_keys`. Detection
@@ -168,7 +179,10 @@ capabilities and a hard wall clock. There is no flag to probe outside it.
 5. [x] YAML rule engine, JSON report
 6. [x] Dynamic prober, rug pull detection   (--url bridge outstanding)
 7. [x] SARIF output, validated against the OASIS schema
-8. [ ] HTML report   <- current
+8. [x] HTML report, self-contained and escaped
+
+The build order is done. `--url` -- the Streamable HTTP bridge -- is the one
+piece still outstanding; see the note above `test_url_targets_are_refused_with_an_accurate_reason`.
 
 ## Style
 

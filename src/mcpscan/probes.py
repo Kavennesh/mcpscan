@@ -223,6 +223,23 @@ def rug_pull_finding(drift: ToolDrift, *, subject: str = "") -> Finding:
         metadata["fields"] = list(drift.fields)
     if drift.client_name:
         metadata["client_name"] = drift.client_name
+    # The two halves, kept apart as well as flattened into `evidence`. A report
+    # that draws a real diff cannot work from the flattened form, for two
+    # reasons that only show up on real input:
+    #
+    #   `evidence` is capped at EVIDENCE_CHARS, so a 300-character description
+    #   -- unremarkable -- pushes the `+` row off the end entirely and the diff
+    #   silently becomes a one-sided quote of the old text;
+    #
+    #   and `before`/`after` are the server's own strings, so one containing a
+    #   newline and a `+ ` writes a row of its own into the flattened output.
+    #   A rug pull is precisely the finding where a server is trying to control
+    #   what a reviewer sees, so letting it author diff rows is the wrong
+    #   default. Both halves are already bounded by `prober.FIELD_SAMPLE_CHARS`.
+    if drift.before is not None:
+        metadata["before"] = drift.before
+    if drift.after is not None:
+        metadata["after"] = drift.after
 
     return Finding(
         rule_id=RUG_PULL.id,

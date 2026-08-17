@@ -1,0 +1,316 @@
+{#
+  The mcpscan HTML report.
+
+  Three rules hold this file together, and each is enforced by a test in
+  tests/test_html_report.py rather than by anyone remembering:
+
+    1. No `|safe`, no `Markup`. Every interpolation is autoescaped. The moment
+       one is not, a tool description becomes markup.
+    2. Every attribute is quoted. Autoescape turns `"` into `&#34;`, which makes
+       title="{{ x }}" safe -- but href={{ x }} unquoted renders a live
+       onerror= handler out of ordinary text.
+    3. Nothing is interpolated inside <style>. HTML escaping is the wrong
+       escaping in a CSS context, so the stylesheet stays static.
+
+  There is no <script> anywhere, and no external reference of any kind: no
+  stylesheet link, no font, no image. The only URLs are documentation links a
+  reader clicks, and those are emitted only when they are absolute https.
+#}<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+{# Self-containment enforced by the browser rather than only by a test: no
+   script of any origin, no image, no font, no fetch. `style-src 'unsafe-inline'`
+   is what permits the one inlined <style> block, which is static. #}
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'none'; style-src 'unsafe-inline'; form-action 'none'; base-uri 'none'">
+<title>{{ tool }} report — {{ summary.total }} finding(s)</title>
+<style>
+:root {
+  --bg: #ffffff; --fg: #1a1d21; --muted: #5c6370; --line: #d8dde3;
+  --card: #f7f8fa; --accent: #24467a;
+  --critical: #8b1a1a; --high: #b3401d; --medium: #8a6d1a; --low: #3d5a80; --info: #5c6370;
+  --add: #1c6b3c; --add-bg: #e7f5ec; --del: #8b1a1a; --del-bg: #fbeaea;
+  --char-bg: #ede3f7; --char-fg: #4a2d73; --char-flag-bg: #f7d9d9; --char-flag-fg: #7a1414;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14171a; --fg: #e6e8eb; --muted: #9aa3ad; --line: #2b3138;
+    --card: #1c2025; --accent: #7fa6dd;
+    --critical: #f08a8a; --high: #f0a97f; --medium: #e0c86a; --low: #93b4dd; --info: #9aa3ad;
+    --add: #7fd3a0; --add-bg: #16301f; --del: #f08a8a; --del-bg: #331717;
+    --char-bg: #33254a; --char-fg: #d9c4f5; --char-flag-bg: #4a1d1d; --char-flag-fg: #f5c4c4;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; padding: 2rem 1.25rem 4rem; background: var(--bg); color: var(--fg);
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  line-height: 1.55; font-size: 15px;
+}
+main { max-width: 60rem; margin: 0 auto; }
+h1 { font-size: 1.5rem; margin: 0 0 .25rem; }
+h2 { font-size: 1.15rem; margin: 2.5rem 0 .75rem; padding-bottom: .3rem; border-bottom: 1px solid var(--line); }
+h3 { font-size: 1rem; margin: 1.5rem 0 .5rem; }
+a { color: var(--accent); }
+code, pre, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .875em; }
+.sub { color: var(--muted); margin: 0 0 1.5rem; }
+.tally { display: flex; flex-wrap: wrap; gap: .5rem; margin: 0 0 1rem; padding: 0; list-style: none; }
+.tally li { border: 1px solid var(--line); border-radius: .4rem; padding: .35rem .7rem; background: var(--card); }
+.tally .n { font-weight: 600; }
+.sev { font-weight: 600; text-transform: uppercase; letter-spacing: .04em; font-size: .75rem; }
+.sev-critical { color: var(--critical); }
+.sev-high { color: var(--high); }
+.sev-medium { color: var(--medium); }
+.sev-low { color: var(--low); }
+.sev-info { color: var(--info); }
+.finding { border: 1px solid var(--line); border-left-width: 4px; border-radius: .4rem;
+  padding: .9rem 1rem; margin: 0 0 1rem; background: var(--card); }
+.finding.sev-critical { border-left-color: var(--critical); }
+.finding.sev-high { border-left-color: var(--high); }
+.finding.sev-medium { border-left-color: var(--medium); }
+.finding.sev-low { border-left-color: var(--low); }
+.finding.sev-info { border-left-color: var(--info); }
+.head { display: flex; flex-wrap: wrap; gap: .6rem; align-items: baseline; }
+.head .rule { font-weight: 600; }
+.where { color: var(--muted); margin: .35rem 0; }
+.where .mono { overflow-wrap: anywhere; }
+.msg { margin: .4rem 0; }
+.label { color: var(--muted); font-size: .8rem; text-transform: uppercase; letter-spacing: .05em; margin: .8rem 0 .25rem; }
+pre.block, .block { white-space: pre-wrap; overflow-wrap: anywhere; background: var(--bg);
+  border: 1px solid var(--line); border-radius: .3rem; padding: .5rem .65rem; margin: 0; }
+.char { display: inline-block; background: var(--char-bg); color: var(--char-fg);
+  border-radius: .25rem; padding: 0 .3rem; margin: 0 .1rem; font-size: .75em;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  vertical-align: baseline; unicode-bidi: isolate; }
+.char.flagged { background: var(--char-flag-bg); color: var(--char-flag-fg); font-weight: 600; }
+.diff { border: 1px solid var(--line); border-radius: .3rem; overflow: hidden; }
+.diff div { padding: .3rem .65rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.diff .del { background: var(--del-bg); color: var(--del); }
+.diff .add { background: var(--add-bg); color: var(--add); }
+table { border-collapse: collapse; width: 100%; margin: .25rem 0; }
+th, td { text-align: left; padding: .3rem .5rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--muted); font-weight: 600; font-size: .8rem; }
+details { margin: .6rem 0 0; }
+summary { cursor: pointer; color: var(--muted); font-size: .85rem; }
+.none { color: var(--muted); font-style: italic; }
+.errors li { color: var(--critical); }
+.ran { color: var(--muted); }
+ul.plain { list-style: none; padding: 0; margin: .25rem 0; }
+ul.plain li { padding: .15rem 0; }
+/* Attacker text must not reorder the report around it. The segmenter removes
+   the bidi controls themselves; this stops any remaining strong-RTL run from
+   escaping its own element. */
+.isolate { unicode-bidi: isolate; }
+</style>
+</head>
+<body>
+<main>
+
+<h1>{{ tool }} report</h1>
+<p class="sub">
+  version {{ version }} · generated {{ generated_at }} · failing at
+  <span class="sev sev-{{ fail_on }}">{{ fail_on }}</span> and above
+</p>
+
+<h2>Summary</h2>
+<ul class="tally">
+{% for severity in severities %}
+  <li><span class="n">{{ summary.by_severity.get(severity, 0) }}</span>
+      <span class="sev sev-{{ severity }}">{{ severity }}</span></li>
+{% endfor %}
+</ul>
+<p>
+  {{ summary.total }} finding(s) in total,
+  {{ summary.at_or_above_fail_on }} at or above {{ summary.fail_on }}.
+  {{ coverage.files_scanned }} file(s) scanned.
+</p>
+
+{#
+  A target that could not be scanned produces no findings and nothing skipped,
+  so without this the page would report it as clean. Every other format sends
+  these to stderr; here the file is the whole artefact.
+#}
+{% if errors %}
+<h3>This scan did not complete</h3>
+<ul class="plain errors">
+  {% for problem in errors %}
+  <li class="isolate">{% for seg in problem %}{% if seg.is_char %}<span
+    class="char" title="{{ seg.name }} ({{ seg.category }})">{{ seg.codepoint }}</span>{% else %}{{ seg.text }}{% endif %}{% endfor %}</li>
+  {% endfor %}
+</ul>
+<p class="none">Findings below are only what could still be collected. This is not a clean result.</p>
+{% endif %}
+
+{% for target in targets %}
+<h2>
+  <span class="isolate">{% for seg in target.label %}{% if seg.is_char %}<span
+    class="char{% if seg.flagged %} flagged{% endif %}"
+    title="{{ seg.name }} ({{ seg.category }})">{{ seg.codepoint }}</span>{% else %}{{ seg.text }}{% endif %}{% endfor %}</span>
+</h2>
+<p class="sub">
+  {{ target.kind }} ·
+  <span class="mono isolate">{% for seg in target.detail %}{% if seg.is_char %}<span
+    class="char" title="{{ seg.name }} ({{ seg.category }})">{{ seg.codepoint }}</span>{% else %}{{ seg.text }}{% endif %}{% endfor %}</span>
+  · {{ target.files_scanned }} file(s) scanned
+</p>
+
+{% if target.server_info %}
+<p class="label">The server described itself as (unverified)</p>
+<table>
+{% for key, value in target.server_info %}
+  <tr><th>{{ key }}</th><td class="isolate">{% for seg in value %}{% if seg.is_char %}<span
+    class="char" title="{{ seg.name }} ({{ seg.category }})">{{ seg.codepoint }}</span>{% else %}{{ seg.text }}{% endif %}{% endfor %}</td></tr>
+{% endfor %}
+</table>
+{% endif %}
+
+{% if not target.findings %}
+<p class="none">No findings for this target.</p>
+{% else %}
+<p>{{ target.findings | length }} finding(s), {{ target.actionable }} at or above {{ fail_on }}.</p>
+{% endif %}
+
+{% for finding in target.findings %}
+<section class="finding sev-{{ finding.severity }}">
+  <div class="head">
+    <span class="sev sev-{{ finding.severity }}">{{ finding.severity }}</span>
+    <span class="rule">{{ finding.rule_id }}</span>
+    <span class="ran">{{ finding.confidence }} confidence</span>
+  </div>
+
+  <p class="msg isolate">{% for seg in finding.message %}{% if seg.is_char %}<span
+    class="char{% if seg.flagged %} flagged{% endif %}"
+    title="{{ seg.name }} ({{ seg.category }})">{{ seg.codepoint }}</span>{% else %}{{ seg.text }}{% endif %}{% endfor %}</p>
+
+  <p class="where">
+    {% if finding.path %}
+      <span class="mono">{{ finding.path }}{% if finding.lines %}:{{ finding.lines }}{% endif %}</span>
+    {% endif %}
+    {% if finding.pointer %}
+      <span class="mono">{{ finding.pointer }}</span>
+    {% endif %}
+  </p>
+  {% for related in finding.related %}
+  <p class="where">from <span class="mono">{{ related }}</span></p>
+  {% endfor %}
+
+  {% if finding.evidence.kind == "diff" %}
+  <p class="label">What changed</p>
+  <div class="diff">
+    {% for line in finding.evidence.lines %}
+    <div class="{% if line.marker == '-' %}del{% elif line.marker == '+' %}add{% endif %} isolate">{{ line.marker }} {% for seg in line.segments %}{% if seg.is_char %}<span
+      class="char" title="{{ seg.name }} ({{ seg.category }})">{{ seg.codepoint }}</span>{% else %}{{ seg.text }}{% endif %}{% endfor %}</div>
+    {% endfor %}
+  </div>
+
+  {% elif finding.evidence.kind == "codepoints" %}
+  <p class="label">
+    {% if finding.evidence.in_context %}The field, with the hidden characters shown{% else %}What matched{% endif %}
+  </p>
+  <p class="block isolate">{% for seg in finding.evidence.body %}{% if seg.is_char %}<span
+    class="char{% if seg.flagged %} flagged{% endif %}"
+    title="{{ seg.name }} ({{ seg.category }})">{{ seg.codepoint }}</span>{% else %}{{ seg.text }}{% endif %}{% endfor %}</p>
+  <table>
+    <tr><th>codepoint</th><th>name</th><th>category</th><th>at</th></tr>
+    {% for char in finding.evidence.characters %}
+    <tr>
+      <td class="mono">{{ char.codepoint }}</td>
+      <td>{{ char.name }}</td>
+      <td class="mono">{{ char.category }}</td>
+      <td class="mono">{{ char.char_offset }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+
+  {% elif finding.evidence.body %}
+  <p class="label">Evidence</p>
+  <p class="block isolate">{% for seg in finding.evidence.body %}{% if seg.is_char %}<span
+    class="char{% if seg.flagged %} flagged{% endif %}"
+    title="{{ seg.name }} ({{ seg.category }})">{{ seg.codepoint }}</span>{% else %}{{ seg.text }}{% endif %}{% endfor %}</p>
+  {% endif %}
+
+  {% if finding.remediation %}
+  <p class="label">What to do</p>
+  <p class="isolate">{% for seg in finding.remediation %}{% if seg.is_char %}<span
+    class="char" title="{{ seg.name }} ({{ seg.category }})">{{ seg.codepoint }}</span>{% else %}{{ seg.text }}{% endif %}{% endfor %}</p>
+  {% endif %}
+
+  {% if finding.has_link %}
+  <p><a href="{{ finding.help_uri }}" rel="noreferrer noopener">{{ finding.rule_id }} documentation</a></p>
+  {% elif finding.help_uri %}
+  <p class="where">documentation: <span class="mono">{{ finding.help_uri }}</span></p>
+  {% endif %}
+
+  {% if finding.metadata %}
+  <details>
+    <summary>Details</summary>
+    <table>
+      {% for key, value in finding.metadata %}
+      <tr><th>{{ key }}</th><td class="isolate">{% for seg in value %}{% if seg.is_char %}<span
+        class="char" title="{{ seg.name }} ({{ seg.category }})">{{ seg.codepoint }}</span>{% else %}{{ seg.text }}{% endif %}{% endfor %}</td></tr>
+      {% endfor %}
+    </table>
+  </details>
+  {% endif %}
+</section>
+{% endfor %}
+{% endfor %}
+
+{#
+  Coverage is printed whether or not anything was found. "Found nothing" and
+  "analysed nothing" look identical in a report that lists only findings, and a
+  reader who trusts a clean result for a scan that never ran is worse off than
+  one who ran nothing at all.
+#}
+<h2>Coverage</h2>
+<p class="sub">
+  Every rule this scan could have reported, and what became of it. A rule that
+  ran and found nothing is not the same as one that never ran.
+</p>
+<table>
+  <tr><th>rule</th><th>what it detects</th><th>looks at</th><th>severity</th><th>outcome</th></tr>
+  {% for rule in catalogue %}
+  <tr>
+    <td class="mono">{% if rule.link %}<a href="{{ rule.link }}" rel="noreferrer noopener">{{ rule.id }}</a>{% else %}{{ rule.id }}{% endif %}</td>
+    <td>{{ rule.title }}</td>
+    <td>{{ rule.family }}</td>
+    <td><span class="sev sev-{{ rule.severity }}">{{ rule.severity }}</span></td>
+    <td>
+      {%- if rule.findings %}{{ rule.findings }} finding(s)
+      {%- elif rule.ran %}ran, found nothing
+      {%- elif rule.reason %}did not run — {{ rule.reason }}
+      {%- else %}not applicable to this target{% endif -%}
+    </td>
+  </tr>
+  {% endfor %}
+</table>
+
+{% if coverage.unparsed %}
+<h3>Files that were not analysed</h3>
+<table>
+  <tr><th>file</th><th>why</th></tr>
+  {% for entry in coverage.unparsed %}
+  <tr><td class="mono">{{ entry.path }}</td><td>{{ entry.reason }}</td></tr>
+  {% endfor %}
+</table>
+{% endif %}
+
+{% if coverage.notes %}
+<h3>Notes</h3>
+<ul class="plain">
+  {% for note in coverage.notes %}
+  <li><span class="mono">{{ note.kind }}</span> — {{ note.detail }}</li>
+  {% endfor %}
+</ul>
+{% endif %}
+
+{% if not coverage.unparsed and not coverage.notes %}
+<p class="none">Nothing else was skipped: every file offered to a rule was analysed.</p>
+{% endif %}
+
+</main>
+</body>
+</html>
