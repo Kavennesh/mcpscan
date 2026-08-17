@@ -258,6 +258,34 @@ def test_every_rule_has_remediation(loaded: LoadedRule) -> None:
     assert len(loaded.rule.meta.remediation) > 30
 
 
+def test_the_catalogue_agrees_with_the_docs_check() -> None:
+    """`catalogue.rule_catalogue` is what SARIF declares the tool looks for.
+
+    It composes the same four homes as `all_rule_metas` above and is the thing
+    that actually ships, so the two are checked against each other rather than
+    one being derived from the other -- a rule added to a home neither of them
+    knows about still fails the docs check, and a rule the catalogue forgot
+    still fails this.
+    """
+    from mcpscan.analyser import default_rules
+    from mcpscan.catalogue import rule_catalogue
+
+    declared = {entry.meta.id for entry in rule_catalogue(default_rules())}
+    assert declared == all_rule_ids()
+
+
+def test_every_bundled_rule_has_a_description() -> None:
+    """SARIF splits a rule's prose in two, and `title` can only be one of them.
+
+    Bundled only: the field is optional in the schema so a contributed pack
+    written before it existed still loads, and SARIF falls back to the title.
+    """
+    for meta in all_rule_metas():
+        assert len(meta.description) > 80, f"{meta.id} has no fullDescription to give"
+        # GitHub truncates a `fullDescription` past 1024 characters.
+        assert len(meta.description) <= 1024, f"{meta.id}'s description is too long"
+
+
 def test_help_uri_is_an_absolute_url() -> None:
     """A repo-relative path points at nothing for anyone who installed a wheel.
 

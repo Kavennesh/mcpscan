@@ -1,0 +1,51 @@
+name: mcpscan
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  static:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - run: uv python install 3.12
+      - run: uv sync --all-extras --dev
+
+      - name: Materialise the deliberately vulnerable fixtures
+        run: |
+          uv run python -c "
+          import sys; sys.path.insert(0, 'tests')
+          from pathlib import Path
+          from sourcefixtures import materialise
+          root = Path('scan-target')
+          materialise(root, 'vulnerable_server')
+          materialise(root, 'poisoned_metadata')
+          "
+
+      - name: Scan
+        run: |
+          set +e
+          uv run mcpscan scan --path scan-target/target \
+            --format sarif --output mcpscan.sarif --yes-i-am-authorised
+          code=$?
+          set -e
+          # Exit 1 means findings, and these fixtures are vulnerable on purpose,
+          # so findings are the expected result. Exit 2 means the scanner could
+          # not do its job, which is a real build failure. A consumer scanning
+          # their own server would want `test $code -eq 0` here instead.
+          test $code -ne 2
+
+      - name: Upload to code scanning
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: mcpscan.sarif
+          category: mcpscan-static

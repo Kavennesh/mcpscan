@@ -43,22 +43,33 @@ TOOL_NAME: Final = "mcpscan"
 TOOL_VERSION: Final = __version__
 
 # ---------------------------------------------------------------------------
-# SARIF mapping, for step 7. Written down here so it is derived from the shape
-# that exists rather than reverse-engineered from it later.
+# SARIF mapping. Written down here at step 5 so it was derived from the shape
+# that exists rather than reverse-engineered later; `sarif.py` implements it.
+# Two lines were wrong when they were written, and are corrected below.
 #
 #   rule_id              -> result.ruleId
 #   severity             -> result.level (critical/high -> error, medium ->
 #                           warning, low/info -> note) + properties.severity
 #   confidence           -> result.properties.confidence
 #   message              -> result.message.text
-#   remediation          -> reportingDescriptor.help.text
-#   help_uri             -> reportingDescriptor.helpUri
+#   remediation          -> reportingDescriptor.help.text / help.markdown
+#   help_uri             -> reportingDescriptor.helpUri, minus any `#anchor`;
+#                           the anchored form is per-finding and cannot live on
+#                           a per-rule descriptor, so it goes in properties.
 #   location.path        -> physicalLocation.artifactLocation.uri
 #   location.start_line  -> physicalLocation.region.startLine
 #   location.end_line    -> physicalLocation.region.endLine
-#   location.span.byte_* -> physicalLocation.region.byteOffset / byteLength
+#   location.span.byte_* -> result.properties.span, and *nowhere else*.
+#                           NOT region.byteOffset: SARIF defines that relative
+#                           to the artifact, and a Span indexes one field's text
+#                           (`Span.of(field_.text, ...)`, engine.py). Against a
+#                           source file those offsets name arbitrary bytes.
 #   location.pointer     -> logicalLocation.fullyQualifiedName
-#   evidence             -> physicalLocation.region.snippet.text
+#   evidence             -> result.properties.evidence, and region.snippet.text
+#                           where a region exists. Not the artifact's bytes in
+#                           that region -- it is the decoded, capped excerpt --
+#                           but it is the text a reader needs and the one SARIF
+#                           renders when the file is not in the commit.
 #   related              -> result.relatedLocations
 #   metadata             -> result.properties
 # ---------------------------------------------------------------------------
@@ -139,14 +150,14 @@ def summarise(findings: Sequence[Finding], fail_on: Severity) -> dict[str, Any]:
     }
 
 
-def build(
-    results: Sequence[tuple[Target, AnalysisResult]],
-    *,
-    fail_on: Severity,
-    generated_at: str | None = None,
-) -> dict[str, Any]:
-    """The whole report as a plain dict, ready for ``json.dumps``."""
-    findings: list[Finding] = []
+def coverage_json(results: Sequence[tuple[Target, AnalysisResult]]) -> dict[str, Any]:
+    """What was and was not analysed, folded across every target.
+
+    Extracted from :func:`build` so SARIF carries the identical block rather
+    than a second, drifting serialisation of the same fields. A consumer that
+    ignores it is deciding to conflate "found nothing" with "looked at nothing";
+    a consumer that cannot find it has been forced into that mistake.
+    """
     files_scanned = 0
     ran: list[str] = []
     skipped: list[dict[str, str]] = []
@@ -154,7 +165,6 @@ def build(
     notes: list[dict[str, str]] = []
 
     for _, result in results:
-        findings.extend(result.findings)
         files_scanned += result.files_scanned
         for rule_id in result.ran:
             if rule_id not in ran:
@@ -163,20 +173,39 @@ def build(
         unparsed.extend({"path": str(p), "reason": why} for p, why in result.unparsed)
         notes.extend({"kind": n.kind, "detail": n.detail} for n in result.notes)
 
+    return {
+        "files_scanned": files_scanned,
+        "rules_run": ran,
+        "rules_skipped": skipped,
+        "unparsed": unparsed,
+        "notes": notes,
+    }
+
+
+def sorted_findings(results: Sequence[tuple[Target, AnalysisResult]]) -> list[Finding]:
+    """Every finding from every target, worst first. One order, one place."""
+    findings: list[Finding] = []
+    for _, result in results:
+        findings.extend(result.findings)
     findings.sort(key=lambda f: f.sort_key)
+    return findings
+
+
+def build(
+    results: Sequence[tuple[Target, AnalysisResult]],
+    *,
+    fail_on: Severity,
+    generated_at: str | None = None,
+) -> dict[str, Any]:
+    """The whole report as a plain dict, ready for ``json.dumps``."""
+    findings = sorted_findings(results)
 
     return {
         "schema_version": SCHEMA_VERSION,
         "tool": {"name": TOOL_NAME, "version": TOOL_VERSION},
         "generated_at": generated_at if generated_at is not None else now_utc(),
         "targets": [target_json(target) for target, _ in results],
-        "coverage": {
-            "files_scanned": files_scanned,
-            "rules_run": ran,
-            "rules_skipped": skipped,
-            "unparsed": unparsed,
-            "notes": notes,
-        },
+        "coverage": coverage_json(results),
         "summary": summarise(findings, fail_on),
         "findings": [finding_json(finding) for finding in findings],
     }

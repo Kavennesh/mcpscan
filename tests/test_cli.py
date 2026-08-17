@@ -15,6 +15,9 @@ cannot run must refuse loudly rather than quietly reporting nothing.
 from __future__ import annotations
 
 import json
+import os
+from collections.abc import Iterator
+from contextlib import contextmanager
 from importlib.metadata import version as metadata_version
 from pathlib import Path
 
@@ -23,13 +26,25 @@ from typer.testing import CliRunner
 
 from mcpscan import __version__, report
 from mcpscan.cli import EXIT_ERROR, EXIT_FINDINGS, EXIT_OK, app
-from tests.sourcefixtures import materialise
+from tests.sourcefixtures import fixture_text, materialise
 
 runner = CliRunner()
 
 
 def scan(*args: str) -> object:
     return runner.invoke(app, ["scan", *args, "--yes-i-am-authorised"])
+
+
+@contextmanager
+def working_directory(path: Path) -> Iterator[Path]:
+    """`--format sarif` writes its artefacts relative to the working directory,
+    so a test that checks where they land has to control it."""
+    previous = Path.cwd()
+    os.chdir(path)
+    try:
+        yield path
+    finally:
+        os.chdir(previous)
 
 
 # --------------------------------------------------------------------------
@@ -257,12 +272,175 @@ def test_exit_codes_are_identical_across_formats(tmp_path: Path) -> None:
     """The format changes what is printed, never what the exit code means."""
     for fixture, expected in [("clean_server", EXIT_OK), ("vulnerable_server", EXIT_FINDINGS)]:
         root = materialise(tmp_path / fixture, fixture)
-        for fmt in ("text", "json"):
+        for fmt in ("text", "json", "sarif"):
+            # Inside tmp_path: a SARIF run writes its artefacts relative to the
+            # working directory, and a test suite should not litter the repo.
+            with working_directory(tmp_path):
+                result = CliRunner().invoke(
+                    app,
+                    ["scan", "--path", str(root), "--format", fmt, "--yes-i-am-authorised"],
+                )
+            assert result.exit_code == expected, f"{fixture}/{fmt}"
+
+
+def test_sarif_output_is_parseable_with_nothing_else_on_stdout(tmp_path: Path) -> None:
+    """Same contract as JSON: `--format sarif > out.sarif` has to upload."""
+    root = materialise(tmp_path, "vulnerable_server")
+    with working_directory(tmp_path):
+        result = CliRunner().invoke(
+            app,
+            ["scan", "--path", str(root), "--format", "sarif", "--yes-i-am-authorised"],
+        )
+    assert result.exit_code == EXIT_FINDINGS
+    payload = json.loads(result.stdout)
+    assert payload["version"] == "2.1.0"
+    assert payload["runs"][0]["results"]
+    assert payload["runs"][0]["tool"]["driver"]["rules"]
+
+
+def test_sarif_writes_the_artefact_its_results_point_at(tmp_path: Path) -> None:
+    """A finding on a nested `inputSchema` description has a pointer and no
+    line even here, so a source scan can still need a file to point at -- and
+    the artefact has to land in the workspace the URIs are relative to.
+    """
+    root = materialise(tmp_path, "poisoned_metadata")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    with working_directory(workspace) as here:
+        result = CliRunner().invoke(
+            app,
+            ["scan", "--path", str(root), "--format", "sarif", "--yes-i-am-authorised"],
+        )
+        assert result.exit_code == EXIT_FINDINGS, result.output
+        payload = json.loads(result.stdout)
+        written = sorted(p.name for p in (here / ".mcpscan").glob("*.survey.json"))
+
+    assert written, "results with no file need an artefact written for them"
+    for entry in payload["runs"][0]["results"]:
+        assert entry["locations"][0]["physicalLocation"]["artifactLocation"]["uri"]
+
+
+def test_a_clean_sarif_scan_leaves_no_artefacts_behind(tmp_path: Path) -> None:
+    root = materialise(tmp_path, "clean_server")
+    with working_directory(tmp_path) as here:
+        result = CliRunner().invoke(
+            app,
+            ["scan", "--path", str(root), "--format", "sarif", "--yes-i-am-authorised"],
+        )
+        assert result.exit_code == EXIT_OK
+        assert not (here / ".mcpscan").exists()
+
+
+def test_sarif_output_flag_writes_a_file(tmp_path: Path) -> None:
+    root = materialise(tmp_path, "vulnerable_server")
+    destination = tmp_path / "report.sarif"
+    with working_directory(tmp_path):
+        result = CliRunner().invoke(
+            app,
+            [
+                "scan", "--path", str(root),
+                "--format", "sarif", "--output", str(destination),
+                "--yes-i-am-authorised",
+            ],
+        )
+    assert result.exit_code == EXIT_FINDINGS
+    assert json.loads(destination.read_text())["version"] == "2.1.0"
+
+
+def test_uris_are_relative_to_the_repository_not_the_working_directory(
+    tmp_path: Path,
+) -> None:
+    """A monorepo package scanning itself must not report a bare `s.py`.
+
+    GitHub resolves a result's URI against the checkout root, so `s.py` sends it
+    looking for a file at the top of the repository -- which finds nothing, or
+    finds a *different* file with that name and hangs the alert on it. Three
+    invocations of the same committed file have to agree on where it is.
+    """
+    (tmp_path / ".git").mkdir()
+    package = tmp_path / "packages" / "server"
+    package.mkdir(parents=True)
+    (tmp_path / "tools").mkdir()
+    (package / "s.py").write_text(fixture_text("poisoned_metadata"), encoding="utf-8")
+
+    def uris(cwd: Path, target: str) -> set[str]:
+        with working_directory(cwd):
             result = CliRunner().invoke(
                 app,
-                ["scan", "--path", str(root), "--format", fmt, "--yes-i-am-authorised"],
+                ["scan", "--path", target, "--format", "sarif", "--yes-i-am-authorised"],
             )
-            assert result.exit_code == expected, f"{fixture}/{fmt}"
+        assert result.exit_code == EXIT_FINDINGS, result.output
+        return {
+            entry["locations"][0]["physicalLocation"]["artifactLocation"]["uri"]
+            for entry in json.loads(result.stdout)["runs"][0]["results"]
+        }
+
+    expected = {"packages/server/s.py"}
+    assert uris(package, ".") == expected
+    assert uris(tmp_path, "packages/server") == expected
+    # From a sibling directory the file used to be unreachable and every result
+    # fell back to the survey artefact, which is a worse place to read an alert.
+    assert uris(tmp_path / "tools", "../packages/server") == expected
+
+
+def test_the_artefact_follows_the_workspace_not_the_output_flag(tmp_path: Path) -> None:
+    """URIs inside a SARIF document are resolved from the repository root, so
+    the artefact they name has to be there -- wherever the report itself was
+    asked to go.
+    """
+    root = materialise(tmp_path, "poisoned_metadata")
+    workspace = tmp_path / "workspace"
+    elsewhere = tmp_path / "elsewhere"
+    workspace.mkdir()
+    elsewhere.mkdir()
+
+    with working_directory(workspace) as here:
+        result = CliRunner().invoke(
+            app,
+            [
+                "scan", "--path", str(root),
+                "--format", "sarif",
+                "--output", str(elsewhere / "report.sarif"),
+                "--yes-i-am-authorised",
+            ],
+        )
+        assert result.exit_code == EXIT_FINDINGS, result.output
+        assert (here / ".mcpscan").is_dir()
+
+    assert not (elsewhere / ".mcpscan").exists()
+    payload = json.loads((elsewhere / "report.sarif").read_text())
+    uris = {
+        e["locations"][0]["physicalLocation"]["artifactLocation"]["uri"]
+        for e in payload["runs"][0]["results"]
+    }
+    assert any(uri.startswith(".mcpscan/") for uri in uris)
+
+
+def test_a_url_target_still_refuses_in_sarif(tmp_path: Path) -> None:
+    """Exit 2 and a document that parses. A consumer reading the exit code has
+    to be able to tell a partial run from a clean one -- which is why the run
+    says it was not successful, and why the shipped workflow will not upload it.
+    """
+    result = CliRunner().invoke(
+        app,
+        [
+            "scan", "--url", "https://example.test/mcp",
+            "--format", "sarif", "--yes-i-am-authorised",
+        ],
+    )
+    assert result.exit_code == EXIT_ERROR
+    payload = json.loads(result.stdout)
+    assert payload["runs"][0]["results"] == []
+    assert payload["runs"][0]["invocations"][0]["executionSuccessful"] is False
+
+
+def test_verify_has_no_sarif_format() -> None:
+    """`verify` reports drift, not findings. Accepting the flag and printing
+    text instead would be the worst of the three options.
+    """
+    result = CliRunner().invoke(app, ["verify", "--format", "sarif"])
+    assert result.exit_code == EXIT_ERROR
+    assert "sarif" in result.output
 
 
 # --------------------------------------------------------------------------

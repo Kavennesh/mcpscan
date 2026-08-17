@@ -93,6 +93,13 @@ class RuleMeta:
     title: str
     severity: Severity
     remediation: str
+    #: A paragraph saying what the rule looks for and why that is worth flagging.
+    #: SARIF splits a rule's prose in two -- `shortDescription` is the line in a
+    #: list, `fullDescription` is what a reader gets before deciding whether to
+    #: open the page -- and `title` can only be one of them. Optional, so a
+    #: third-party pack written before this field existed still loads; SARIF
+    #: falls back to the title rather than emitting an empty string.
+    description: str = ""
 
     @property
     def doc_filename(self) -> str:

@@ -26,6 +26,7 @@ one outside it.
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
@@ -35,7 +36,15 @@ from typing import Any, Final
 
 from mcpscan import anomalies as anomaly_map
 from mcpscan.canary import CanarySet, env_for
-from mcpscan.client import CLIENT_NAME, HandshakeError, MCPClient, ServerSurvey, tool_fingerprint
+from mcpscan.client import (
+    CLIENT_NAME,
+    SALIENT_KEYS,
+    HandshakeError,
+    MCPClient,
+    ServerSurvey,
+    salient_fields,
+    tool_fingerprint,
+)
 from mcpscan.engine import CoverageNote
 from mcpscan.models import Finding, Target
 from mcpscan.probes import (
@@ -378,13 +387,17 @@ def diff_looks(
 ) -> list[ToolDrift]:
     """Classify what changed between two looks. Pure -- CI tests it directly."""
     drifts: list[ToolDrift] = []
+    # The *baseline* index, not the later one. A finding points into the survey
+    # artefact, which is written from the baseline -- so an index taken from the
+    # later listing names a different tool the moment a server reorders, which is
+    # exactly the kind of server this rule exists for.
     index_of = {
         name: i
-        for i, tool in enumerate(later.tools)
+        for i, tool in enumerate(baseline.tools)
         if isinstance(name := tool.get("name"), str)
     }
-    described = _descriptions(later.tools)
-    was = _descriptions(baseline.tools)
+    salient_now = _salient(later.tools)
+    salient_was = _salient(baseline.tools)
 
     for name in sorted(set(baseline.fingerprints) | set(later.fingerprints)):
         before = baseline.fingerprints.get(name)
@@ -403,28 +416,68 @@ def diff_looks(
         else:
             kind = DriftKind.CHANGED_SILENTLY
 
+        was = salient_was.get(name, {})
+        now = salient_now.get(name, {})
+        changed = (
+            ()
+            if kind in (DriftKind.APPEARED, DriftKind.VANISHED)
+            else tuple(key for key in SALIENT_KEYS if was.get(key) != now.get(key))
+        )
+        # What the finding quotes is the field it points at. Naming a single
+        # changed field and then diffing the description regardless is how a
+        # schema-only change came to report `- Runs a command.` against
+        # `+ Runs a command.` -- two identical lines and no hint of what moved.
+        shown = changed[0] if len(changed) == 1 else "description"
+
         drifts.append(
             ToolDrift(
                 tool=name,
                 kind=kind,
                 condition=condition,
-                before=was.get(name),
-                after=described.get(name),
-                index=index_of.get(name),
+                before=_render_field(was.get(shown)),
+                after=_render_field(now.get(shown)),
+                baseline_index=index_of.get(name),
                 client_name=later.client_name if client_targeted else None,
+                fields=changed,
             )
         )
     return drifts
 
 
-def _descriptions(tools: Sequence[Mapping[str, Any]]) -> dict[str, str]:
-    out: dict[str, str] = {}
-    for tool in tools:
-        name = tool.get("name")
-        description = tool.get("description")
-        if isinstance(name, str) and isinstance(description, str):
-            out[name] = description
-    return out
+def _salient(tools: Sequence[Mapping[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Tool name -> the fields the fingerprint is taken over.
+
+    The fingerprint says *that* a tool drifted; this says *which part of it*.
+    Both read `client.SALIENT_KEYS`, so a field cannot be watched by one and
+    invisible to the other.
+    """
+    return {
+        name: salient_fields(tool)
+        for tool in tools
+        if isinstance(name := tool.get("name"), str)
+    }
+
+
+#: Long enough to show a changed schema, short enough that a server does not get
+#: to choose how long the report is. Same argument as `models.EVIDENCE_CHARS`,
+#: which caps what survives onto the finding anyway.
+FIELD_SAMPLE_CHARS: Final = 400
+
+
+def _render_field(value: object) -> str | None:
+    """One salient field as a line a reader can diff against another.
+
+    A description is already text. A schema or an annotations block is not, and
+    rendering it with sorted keys is what stops a reordered dict from looking
+    like a change in the diff the finding quotes.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value
+    else:
+        text = json.dumps(value, sort_keys=True, ensure_ascii=False, default=str)
+    return text if len(text) <= FIELD_SAMPLE_CHARS else text[:FIELD_SAMPLE_CHARS] + "..."
 
 
 async def probe_rug_pull(
@@ -499,6 +552,9 @@ async def probe_scope_escape(
     outcome: ProbeOutcome,
 ) -> None:
     """Call every declared tool with traversal payloads and watch for a canary."""
+    # Enumerated from the baseline, so the index a finding carries addresses the
+    # same listing the report's survey artefact was written from. MCP-007 had to
+    # be corrected for taking its index from a later look; this never did.
     tools = baseline.tools
     if not tools:
         outcome.note("probe_skipped", "scope escape: the server declares no tools")

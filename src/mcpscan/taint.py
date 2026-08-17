@@ -348,6 +348,16 @@ class UnsanitisedSinkRule:
         id="MCP-003",
         title="Tool parameter reaches a dangerous sink unsanitised",
         severity=Severity.CRITICAL,
+        description=(
+            "A value the model controls -- a tool's parameter -- flowing into a "
+            "shell, an interpreter, a filesystem path or an outbound request "
+            "without passing through anything that constrains it. Found by "
+            "following assignments, f-strings, concatenation and formatting "
+            "through the tool's function in the source tree. The parameter is "
+            "chosen by a model that is reading descriptions written by the same "
+            "server, so an argument here is attacker-influenced in a way an "
+            "ordinary function argument is not."
+        ),
         remediation=(
             "Do not pass a tool parameter into a shell, an interpreter, or a "
             "filesystem path without constraining it first. Prefer an allowlist "

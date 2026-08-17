@@ -1,28 +1,48 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Final
 
 import typer
 
-from mcpscan import __version__, report
+from mcpscan import __version__, report, sarif
 from mcpscan import targets as tgt
 from mcpscan.analyser import AnalysisResult, default_rules
 from mcpscan.consent import ensure_consent
-from mcpscan.engine import RuleError
+from mcpscan.engine import RuleError, RuleSet
 from mcpscan.lockfile import Lock, LockError
 from mcpscan.models import Severity, Target, TargetKind
 from mcpscan.prober import ProbeBudget
 from mcpscan.ruleloader import lint_all, load_all
 from mcpscan.sandbox import SandboxHandle
-from mcpscan.scanrun import ScanOptions, lock_path_for, run_scan, run_verify
+from mcpscan.scanrun import ScanOptions, ScanRun, lock_path_for, run_scan, run_verify
 
 EXIT_OK, EXIT_FINDINGS, EXIT_ERROR = 0, 1, 2
 
+#: Where a SARIF run puts the artefacts its results point at. Beside the lock
+#: file rather than beside `--output`, because the URIs inside the document are
+#: repository-relative and a reader resolves them from the workspace root --
+#: wherever the report itself was asked to go.
+ARTEFACT_DIR: Final = Path(".mcpscan")
+
 
 class ReportFormat(StrEnum):
+    TEXT = "text"
+    JSON = "json"
+    SARIF = "sarif"
+
+
+class VerifyFormat(StrEnum):
+    """`verify` reports drift, not findings, and drift has no SARIF shape.
+
+    Its own enum rather than a shared one so `verify --format sarif` is a usage
+    error naming the two formats that exist, instead of falling through to the
+    text branch and printing something the caller did not ask for.
+    """
+
     TEXT = "text"
     JSON = "json"
 
@@ -202,11 +222,15 @@ def scan(
             raise typer.Exit(EXIT_ERROR) from exc
         typer.echo(f"wrote {destination} ({len(run.locks)} server(s))", err=True)
 
-    rendered = (
-        report.render(run.results, fail_on=fail_on)
-        if format is ReportFormat.JSON
-        else _text(run.results, fail_on)
-    )
+    try:
+        rendered = _render(run, format, fail_on=fail_on, rules=ruleset)
+    except OSError as exc:
+        # A SARIF run writes the artefacts its results point at. Failing to write
+        # part of the output that was asked for is a scanner error, exactly as an
+        # unwritable --output is.
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(EXIT_ERROR) from exc
+
     if output is not None:
         output.write_text(rendered, encoding="utf-8")
     else:
@@ -217,6 +241,72 @@ def scan(
         raise typer.Exit(EXIT_ERROR)
     worst = EXIT_FINDINGS if any(r.at_or_above(fail_on) for _, r in run.results) else EXIT_OK
     raise typer.Exit(worst)
+
+
+def _render(run: ScanRun, format: ReportFormat, *, fail_on: Severity, rules: RuleSet) -> str:
+    if format is ReportFormat.JSON:
+        return report.render(run.results, fail_on=fail_on)
+    if format is ReportFormat.SARIF:
+        # The repository root, not the working directory -- see `workspace_root`.
+        workspace = sarif.workspace_root()
+        return sarif.render(
+            run.results,
+            rules=rules,
+            fail_on=fail_on,
+            surveys=_write_artefacts(run, workspace),
+            workspace=workspace,
+            errors=run.errors,
+        )
+    return _text(run.results, fail_on)
+
+
+def _slug(label: str) -> str:
+    """A filename from a target label.
+
+    Labels can hold anything -- a path, a scoped npm package, a config key
+    someone typed -- so the readable part is reduced to something a filesystem
+    accepts and a short digest of the original is appended. Two labels that
+    reduce to the same string are still two files, which matters because they
+    are two targets and a result points at one of them.
+    """
+    safe = "".join(char if char.isalnum() or char in "-_." else "-" for char in label)
+    safe = safe.strip("-.") or "target"
+    digest = hashlib.sha256(label.encode("utf-8", "surrogatepass")).hexdigest()[:8]
+    return f"{safe[:60]}-{digest}"
+
+
+def _write_artefacts(run: ScanRun, workspace: Path) -> dict[str, sarif.WrittenSurvey]:
+    """Write one survey file per target that has a finding needing a file.
+
+    "Needing one" is any finding this workspace cannot place in a source file:
+    everything from a live server, the nested `inputSchema` fields of a source
+    scan, and a tree scanned from outside the repository the report will be read
+    in. Targets with nothing to anchor get no file, so a clean scan leaves no
+    directory behind.
+    """
+    artefacts: dict[str, sarif.WrittenSurvey] = {}
+    for target, result in run.results:
+        survey = run.surveys.get(target.label)
+        if survey is None:
+            continue
+        placeable = (
+            sarif.source_uri(finding.location, target, workspace) is not None
+            for finding in result.findings
+        )
+        if all(placeable):
+            continue
+        destination = ARTEFACT_DIR / f"{_slug(target.label)}.survey.json"
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(survey.text, encoding="utf-8")
+        typer.echo(f"wrote {destination} (metadata surveyed from {target.label})", err=True)
+        # Written beside the caller, addressed from the repository root: those
+        # differ the moment a scan runs from a subdirectory, and the URI in the
+        # document is the one that has to resolve for whoever reads the report.
+        artefacts[target.label] = sarif.WrittenSurvey(
+            uri=sarif.workspace_uri(destination, workspace) or destination.as_posix(),
+            artefact=survey,
+        )
+    return artefacts
 
 
 def _text(results: list[tuple[Target, AnalysisResult]], fail_on: Severity) -> str:
@@ -273,9 +363,9 @@ def verify(
         typer.Option("--target", help="Verify only this server from the lock"),
     ] = None,
     format: Annotated[
-        ReportFormat,
+        VerifyFormat,
         typer.Option("--format", help="Output format"),
-    ] = ReportFormat.TEXT,
+    ] = VerifyFormat.TEXT,
     yes_i_am_authorised: Annotated[
         bool,
         typer.Option("--yes-i-am-authorised", help="Skip the consent prompt (CI)"),
@@ -322,7 +412,7 @@ def verify(
     typer.echo(f"verifying {len(loaded.servers)} server(s) against {path}", err=True)
     result = asyncio.run(run_verify(loaded, {}, budget=ProbeBudget()))
 
-    if format is ReportFormat.JSON:
+    if format is VerifyFormat.JSON:
         import json
 
         typer.echo(json.dumps(result.to_json(), indent=2) + "\n", nl=False)

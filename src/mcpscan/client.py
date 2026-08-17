@@ -226,24 +226,30 @@ class ServerSurvey:
     prompts: list[dict[str, Any]] = field(default_factory=list)
 
 
+#: The fields whose silent mutation between two listings *is* the rug pull:
+#: everything a server serves that steers a model. Named once because two
+#: things read it -- the fingerprint below, which decides *whether* a tool
+#: drifted, and ``prober.diff_looks``, which decides *which field* did. A second
+#: copy of this tuple would let a rule fire on a field the report cannot name.
+SALIENT_KEYS: Final = ("title", "description", "inputSchema", "outputSchema", "annotations")
+
+
+def salient_fields(tool: Mapping[str, Any]) -> dict[str, Any]:
+    """The parts of one tool that steer a model, in a stable order."""
+    return {key: tool[key] for key in SALIENT_KEYS if key in tool}
+
+
 def tool_fingerprint(tools: list[dict[str, Any]]) -> dict[str, str]:
     """Map each tool name to a stable digest of everything that steers a model.
 
-    Name, title, description, schemas and annotations -- the fields whose silent
-    mutation between two listings *is* the rug pull. Sorted keys so the digest
-    does not change when a server reorders its JSON.
+    Sorted keys so the digest does not change when a server reorders its JSON.
     """
     fingerprints: dict[str, str] = {}
     for tool in tools:
         name = tool.get("name")
         if not isinstance(name, str):
             continue
-        salient = {
-            key: tool.get(key)
-            for key in ("title", "description", "inputSchema", "outputSchema", "annotations")
-            if key in tool
-        }
-        fingerprints[name] = json.dumps(salient, sort_keys=True, default=str)
+        fingerprints[name] = json.dumps(salient_fields(tool), sort_keys=True, default=str)
     return fingerprints
 
 

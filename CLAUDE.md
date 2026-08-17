@@ -43,7 +43,11 @@ All three must pass before any commit. mypy runs in strict mode; do not add
 - `src/mcpscan/client.py` -- MCP client, revision 2025-11-25.
 - `src/mcpscan/document.py` -- one metadata shape for both a live survey and a
   source tree, plus `walk_text`, the traversal every metadata rule runs on.
-  JSON pointers are RFC 6901 in fragment form: `#/tools/3/description`.
+  JSON pointers are RFC 6901 in fragment form: `#/tools/3/description`. Also
+  `serialise`, which writes the survey artefact SARIF anchors its results in.
+  That lives here and not in `sarif.py` so the file's pointers and the rules'
+  pointers are built beside each other; `ensure_ascii=True` throughout, which is
+  what survives a lone surrogate off the wire and makes a column an offset.
 - `src/mcpscan/source.py` -- `ast` extraction of tool definitions. Per-field line
   ranges point at the *string literal*, not the `def`. Paths are relative to the
   scan root.
@@ -63,7 +67,23 @@ All three must pass before any commit. mypy runs in strict mode; do not add
 - `src/mcpscan/anomalies.py` -- `AnomalyKind` -> `Finding`. Fifteen kinds map to
   MCP-004/005/006; four are coverage notes, never findings.
 - `src/mcpscan/report.py` -- JSON, `schema_version: 1`. The only clock outside
-  `sandbox.py`. Stdout carries the report and nothing else.
+  `sandbox.py`. Stdout carries the report and nothing else. Holds the SARIF
+  mapping as a comment; `coverage_json` and `sorted_findings` are shared so both
+  formats describe one scan the same way.
+- `src/mcpscan/catalogue.py` -- every rule that can appear in a finding, from all
+  four homes. SARIF's driver must declare rules that did *not* fire, and a
+  `ruleId` naming no descriptor gets the whole upload rejected.
+- `src/mcpscan/sarif.py` -- SARIF 2.1.0. Pure. Four things in it are not
+  arbitrary: no `automationDetails` (the CI `category:` owns it, and a
+  tool-supplied one makes two jobs close each other's alerts), fingerprints built
+  from **nothing positional** (a line number in one reopens every alert on every
+  push), the span reported as a property rather than as `region.byteOffset`,
+  which SARIF defines relative to the file, and URIs relative to the
+  **repository root** rather than the working directory -- `workspace_root`
+  walks up for `.git`, because a scan run from a package subdirectory that
+  reported `s.py` sends GitHub looking for a file at the top of the repo.
+  A finding with a `path` anchors at its source file; the artefact is only ever
+  the fallback, since an alert reads better on a committed file.
 - `src/mcpscan/analyser.py` -- runs the rules and reports what it could not run.
 - `src/mcpscan/canary.py` -- planted secrets. Decoy files mounted read-only at
   `/home/canary`, env values generated per scan from `Target.env_keys`. Detection
@@ -73,14 +93,27 @@ All three must pass before any commit. mypy runs in strict mode; do not add
   `ProbeBudget` allowances are **per probe, never a shared pool** -- one pool lets
   the rug pull drain it before the other probes run.
 - `src/mcpscan/probes.py` -- MCP-007/008/009. Concealment raises confidence: a
-  silent mutation outranks an announced one.
+  silent mutation outranks an announced one. MCP-007 locates the **field** that
+  drifted (`#/tools/3/description`) because it is a claim about that field's
+  text; MCP-008 and MCP-009 locate the tool object, because they are claims
+  about what a tool *did* when called. All three index the **baseline** listing,
+  which is the survey the report's artefact is written from -- an index from a
+  later listing names a different tool the moment a server reorders, and a
+  server that reorders is what MCP-007 is for.
 - `src/mcpscan/fetch.py` -- fetcher downloads with network, runner executes
   offline from a read-only mount. Nothing installs in the runner's 64 MB tmpfs.
 - `src/mcpscan/lockfile.py` -- `.mcpscan.lock` and drift. Absence is never success.
 - `src/mcpscan/scanrun.py` -- the async half of a scan. **One `asyncio.run` per
   scan, never one per target**: `sandbox.py` holds a module-level `asyncio.Lock`.
+  Serialises each target's survey and redacts canaries out of every finding's
+  evidence, because this is the last place that still holds the canaries. It
+  never *writes* the artefact -- the CLI does, so `--format` changes what is
+  printed and not what a scan does.
 - `docs/rules/<ID>.md` -- one page per rule, by convention. CI checks both
   directions, so neither a rule nor a page can be added without the other.
+- `tests/schemas/` -- the vendored OASIS SARIF schema, with its provenance and
+  checksum. Never fetched at test time: that would assert a network is reachable
+  rather than that the output is valid.
 
 ## Build order -- do not skip ahead
 
@@ -99,6 +132,14 @@ directory in the fetcher, mount it read-only, install nothing in the runner.
 `fetch.py` uses `npm install --ignore-scripts`, which departs from the letter of
 `Dockerfile.fetcher` ("fetching uses npm pack") while keeping its stated reason;
 that is a deliberate call, documented in the module, and worth re-reviewing.
+
+**A SARIF result without a `physicalLocation` is silently discarded**, and the
+upload still reports success. Every finding from a live server carries a JSON
+pointer and no file, so `--format sarif` writes `.mcpscan/<slug>.survey.json` --
+the metadata the rules walked, canaries redacted, deterministic so it diffs
+cleanly -- and anchors those results at lines in it. A source finding the
+workspace cannot place lands there too, for the same reason: a `file://` URI
+outside the repository is dropped exactly as thoroughly as no location at all.
 
 **Precision is not negotiable in the rules.** `tests/test_negative_controls.py`
 holds the fixtures that must report *zero*: `server_clean.py`'s metadata, ~50
@@ -126,8 +167,8 @@ capabilities and a hard wall clock. There is no flag to probe outside it.
 4. [x] Static analyser, 3 rules
 5. [x] YAML rule engine, JSON report
 6. [x] Dynamic prober, rug pull detection   (--url bridge outstanding)
-7. [ ] SARIF output   <- current
-8. [ ] HTML report
+7. [x] SARIF output, validated against the OASIS schema
+8. [ ] HTML report   <- current
 
 ## Style
 

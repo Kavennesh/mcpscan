@@ -21,16 +21,18 @@ exit code work identically whether a target was a directory or a running server.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from mcpscan.analyser import AnalysisResult, Subject, analyse
 from mcpscan.canary import CanarySet
+from mcpscan.document import MetadataDocument, SurveyArtefact, serialise
 from mcpscan.engine import CoverageNote, RuleSet
 from mcpscan.fetch import FetchError, fetch
 from mcpscan.lockfile import Drift, Lock, ServerLock, VerifyResult, compare
-from mcpscan.models import Target, TargetKind
+from mcpscan.models import Finding, Target, TargetKind
 from mcpscan.prober import ProbeBudget, probe
 from mcpscan.sandbox import Mount, SandboxError
 
@@ -48,6 +50,13 @@ class ScanRun:
 
     results: list[tuple[Target, AnalysisResult]] = field(default_factory=list)
     locks: dict[str, ServerLock] = field(default_factory=dict)
+    #: Target label -> the metadata it advertised, serialised. Built here rather
+    #: than at render time because this is the only place that still holds the
+    #: canaries needed to redact it, and never *written* here: a scan does I/O
+    #: for the sandbox, not for a report. The CLI writes whichever of these the
+    #: chosen format needs, so `--format` changes what is printed and not what
+    #: the scan does.
+    surveys: dict[str, SurveyArtefact] = field(default_factory=dict)
     #: Targets that could not be scanned at all. Exit 2, never exit 1.
     errors: list[str] = field(default_factory=list)
     #: Things worth saying that are neither a finding nor a failure.
@@ -59,7 +68,7 @@ async def run_scan(targets: list[Target], options: ScanOptions) -> ScanRun:
     run = ScanRun()
     for target in targets:
         if target.kind is TargetKind.PATH:
-            run.results.append((target, _scan_path(target, options)))
+            run.results.append((target, _scan_path(target, options, run)))
         elif target.kind is TargetKind.STDIO:
             await _scan_stdio(target, options, run)
         else:
@@ -81,10 +90,15 @@ async def run_scan(targets: list[Target], options: ScanOptions) -> ScanRun:
     return run
 
 
-def _scan_path(target: Target, options: ScanOptions) -> AnalysisResult:
+def _scan_path(target: Target, options: ScanOptions, run: ScanRun) -> AnalysisResult:
     if target.path is None:  # unreachable; satisfies the type checker
         return AnalysisResult()
-    return analyse(Subject.from_path(target.path, label=target.label), options.rules)
+    # The Subject is kept rather than built inline, because its document is the
+    # only thing that can anchor a finding on a nested `inputSchema` field: those
+    # carry a pointer and no line, even on a source scan.
+    subject = Subject.from_path(target.path, label=target.label)
+    run.surveys[target.label] = serialise(subject.document or MetadataDocument())
+    return analyse(subject, options.rules)
 
 
 async def _scan_stdio(target: Target, options: ScanOptions, run: ScanRun) -> None:
@@ -132,14 +146,34 @@ async def _scan_stdio(target: Target, options: ScanOptions, run: ScanRun) -> Non
             f"{target.label}: could not complete the MCP handshake, so nothing "
             "was examined. This is not a clean result."
         )
-        # Still surface whatever the transport managed to record on the way down.
-        run.results.append((target, _merge(target, outcome, options, static=AnalysisResult())))
+        # Still surface whatever the transport managed to record on the way down,
+        # and still serialise an artefact for it. Those findings are pointer-only,
+        # so a format that needs a file to point at would otherwise drop the
+        # results from the one server that misbehaved badly enough never to
+        # finish talking. An empty document is a document: it has a line 1.
+        run.surveys[target.label] = serialise(MetadataDocument(), redact=canaries.redact)
+        run.results.append(
+            (
+                target,
+                _merge(
+                    target,
+                    outcome,
+                    options,
+                    static=AnalysisResult(),
+                    redact=canaries.redact,
+                ),
+            )
+        )
         return
 
-    static = analyse(
-        Subject.from_survey(outcome.survey, label=target.label), options.rules
+    subject = Subject.from_survey(outcome.survey, label=target.label)
+    run.surveys[target.label] = serialise(
+        subject.document or MetadataDocument(), redact=canaries.redact
     )
-    run.results.append((target, _merge(target, outcome, options, static=static)))
+    static = analyse(subject, options.rules)
+    run.results.append(
+        (target, _merge(target, outcome, options, static=static, redact=canaries.redact))
+    )
     # Redact before hashing. A server that echoes a canary into a description
     # would otherwise hash a fresh random token every run, and `verify` would be
     # permanently red for a reason nobody could work out from the diff.
@@ -149,13 +183,19 @@ async def _scan_stdio(target: Target, options: ScanOptions, run: ScanRun) -> Non
 
 
 def _merge(
-    target: Target, outcome: Any, options: ScanOptions, *, static: AnalysisResult
+    target: Target,
+    outcome: Any,
+    options: ScanOptions,
+    *,
+    static: AnalysisResult,
+    redact: Callable[[str], str] | None = None,
 ) -> AnalysisResult:
     """One result per target, whatever produced the findings inside it."""
     findings = [*static.findings, *outcome.findings]
     for finding in findings:
         if not finding.subject:
             finding.subject = target.label
+        _redact_evidence(finding, redact)
     findings.sort(key=lambda f: f.sort_key)
 
     ran = [*static.ran, *outcome.ran]
@@ -174,6 +214,25 @@ def _merge(
         skipped=skipped,
         notes=[*static.notes, *outcome.notes],
     )
+
+
+def _redact_evidence(finding: Finding, redact: Callable[[str], str] | None) -> None:
+    """Take canary tokens back out of the text a report quotes.
+
+    MCP-009 already redacts its own excerpt, but a server that echoes an
+    environment value into a *tool description* produces an MCP-001 or MCP-002
+    finding whose evidence is that description verbatim -- and evidence travels
+    into the JSON report, into SARIF, and from there into a code-scanning alert
+    on someone's repository. The token is scan-scoped and worth nothing, which is
+    exactly why printing it is bad: it teaches the next reader to search for a
+    string that will never appear again, and it changes on every run, so a
+    fingerprint or a diff built on it never settles.
+    """
+    if redact is None or finding.evidence is None:
+        return
+    cleaned = redact(finding.evidence)
+    if cleaned != finding.evidence:
+        finding.evidence = cleaned
 
 
 # --------------------------------------------------------------------------

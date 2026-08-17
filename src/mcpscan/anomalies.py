@@ -44,6 +44,15 @@ FRAMING = RuleMeta(
     id="MCP-004",
     title="Malformed protocol framing",
     severity=Severity.MEDIUM,
+    description=(
+        "Departures from the stdio transport's framing rules, observed on the "
+        "wire during a live scan: oversized lines, invalid UTF-8, embedded "
+        "newlines, non-JSON output on stdout, JSON nested deeply enough to "
+        "exhaust a parser, and JSON-RPC batches the 2025-11-25 revision "
+        "removed. Severity varies per kind within this rule -- an npm banner on "
+        "stdout is hygiene, a stack-exhaustion attempt is not, and ranking them "
+        "alike would get the report skimmed."
+    ),
     remediation=(
         "Emit only newline-delimited JSON-RPC on stdout, one message per line, "
         "UTF-8, with no embedded newlines. Logging and diagnostics belong on "
@@ -55,6 +64,14 @@ CORRELATION = RuleMeta(
     id="MCP-005",
     title="Response correlation abuse",
     severity=Severity.HIGH,
+    description=(
+        "A server answering a request id more than once, answering an id the "
+        "client never issued, or sending a request the client's declared "
+        "capabilities never invited. Each one lets a server replace an answer "
+        "the client has already acted on, or drive the client rather than serve "
+        "it -- and a client that accepts either has no way to say which of two "
+        "answers was the real one."
+    ),
     remediation=(
         "Answer each request id exactly once and never send a response for an id "
         "the client did not issue. A client that accepts either can have state it "
@@ -66,6 +83,13 @@ CONFORMANCE = RuleMeta(
     id="MCP-006",
     title="Protocol conformance and capability mismatch",
     severity=Severity.HIGH,
+    description=(
+        "A server serving a surface it never declared, negotiating a protocol "
+        "revision it should not, or paginating in a way that does not "
+        "terminate. An undeclared capability is the interesting one: a client "
+        "decides what to review, cache and permission from the capability set, "
+        "so a surface that is not declared is a surface nothing reviews."
+    ),
     remediation=(
         "Declare every capability the server actually serves, terminate "
         "pagination, and negotiate the latest protocol revision supported. A "

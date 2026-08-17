@@ -27,6 +27,17 @@ id: MCP-001
 title: Invisible or deceptive Unicode in tool metadata
 severity: high
 
+description: >
+  Characters in tool metadata that a reviewer cannot see but a model reads in
+  full: tag characters, zero-width joiners and spaces, bidirectional overrides
+  and isolates, and other format characters used where nothing about the
+  surrounding script justifies them. Metadata is the one part of an MCP server
+  that reaches a model verbatim and reaches a human only through a renderer, so
+  a payload written in invisible codepoints is reviewed by nobody and obeyed by
+  the model. Legitimate uses -- emoji ZWJ sequences, Persian ZWNJ, bidi marks in
+  right-to-left text -- are excluded by a predicate that looks at the
+  neighbouring characters rather than by the pattern.
+
 remediation: >
   Remove the characters, or replace them with their visible equivalents. Text a
   reviewer cannot see is text they cannot review, and every one of these reaches

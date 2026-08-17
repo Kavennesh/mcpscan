@@ -120,6 +120,11 @@ class RuleSpec(BaseModel):
     title: Annotated[str, Field(min_length=1)]
     severity: Severity
     remediation: Annotated[str, Field(min_length=1)]
+    #: Optional prose, one paragraph. Becomes SARIF's `fullDescription`, which is
+    #: what a reader sees in a code-scanning alert before they click through to
+    #: the page. Optional because a pack written before this field existed must
+    #: still load; a rule without one falls back to its title.
+    description: str = ""
     patterns: Annotated[list[PatternSpec], Field(min_length=1)]
     tests: TestsSpec
     match_mode: MatchMode = MatchMode.SPANS
@@ -199,6 +204,7 @@ def parse_rule(data: object, origin: str, *, builtin: bool) -> LoadedRule:
             title=spec.title,
             severity=spec.severity,
             remediation=" ".join(spec.remediation.split()),
+            description=" ".join(spec.description.split()),
         ),
         patterns=compiled,
         match_mode=spec.match_mode,

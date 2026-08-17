@@ -13,6 +13,16 @@ id: MCP-002
 title: Model-directed instructions in tool metadata
 severity: high
 
+description: >
+  Tool metadata that issues orders instead of describing a tool: overriding
+  earlier instructions, directing the model to conceal what it does from the
+  user, demanding that another tool be called first, or asking for credentials
+  and configuration files to be passed along as arguments. A description is
+  documentation, and the thing reading it is a model holding the user's
+  credentials -- so text that reads as an instruction is an instruction. The
+  `instructions` field from `initialize` is exempt, because directing a client
+  is what that field is for.
+
 remediation: >
   Rewrite the description to document what the tool does rather than to direct
   the model that reads it. If the server genuinely needs to state a calling

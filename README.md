@@ -52,6 +52,9 @@ mcpscan rules list                         # what would run
 mcpscan rules lint                         # advisory regex warnings
 ```
 
+Three output formats: `--format text` for a human, `--format json` for a script,
+`--format sarif` for a code-scanning tab. See [CI](#ci).
+
 A `--stdio` scan launches the server in the sandbox and asks the questions only a
 running server can answer: does its tool list change after you trust it, will its
 tools read files outside their scope, does it leak the environment it was given.
@@ -109,6 +112,9 @@ Nothing shrinks silently: when a budget or a cap stops a probe, the scan says so
 | MCP-004 | Malformed protocol framing |
 | MCP-005 | Response correlation abuse |
 | MCP-006 | Protocol conformance and capability mismatch |
+| MCP-007 | Tool definition changed after inspection |
+| MCP-008 | Tool read outside its declared scope |
+| MCP-009 | Environment secret disclosed in a server response |
 
 Every rule has a page under [`docs/rules/`](docs/rules/) explaining the
 vulnerability and how to fix it. MCP-001 and MCP-002 are YAML; contributors can
@@ -125,6 +131,55 @@ with an injection test proving the control is not vacuous.
 Writing those corpora first caught six false positives before release, including
 a rule that suppressed a lone RLM because the RLM itself satisfied the
 "contains RTL text" check.
+
+## CI
+
+`--format sarif` emits SARIF 2.1.0, which is what
+[`github/codeql-action/upload-sarif`](https://github.com/github/codeql-action)
+turns into alerts on the Security tab. Every rule mcpscan could fire is declared
+in the run, with a link to its page, so a rule that found nothing is visibly a
+rule that ran.
+
+```yaml
+- run: |
+    set +e
+    mcpscan scan --path . --format sarif --output mcpscan.sarif --yes-i-am-authorised
+    code=$?; set -e
+    test "$code" -ne 2          # exit 2 is a scanner error: fail, and do not upload
+- uses: github/codeql-action/upload-sarif@v4
+  with:
+    sarif_file: mcpscan.sarif
+```
+
+A partial run must never be uploaded as if it were whole, because GitHub closes
+every alert an upload does not contain. That is why the exit code is checked
+before the upload rather than after it, and why the run itself records
+`executionSuccessful: false` when a target could not be scanned.
+
+Two details worth knowing:
+
+**Alerts are tracked by a fingerprint that contains no line numbers.** Inserting
+a line above a finding does not close its alert and open a new one, and neither
+does reordering a server's tool list or bumping a pinned version. The trade is
+that renaming a tool or moving a file does start a new alert.
+
+**A live server has no file to annotate**, and GitHub discards a result with no
+location. A finding from a source tree anchors at its own file and line; only a
+finding with no file -- everything from a live server, and the nested
+`inputSchema` fields of a source scan -- falls back to `.mcpscan/<server>.survey.json`,
+the metadata the server actually served, with scan canaries redacted. That file
+is deterministic: it changes when the server changes and not otherwise. Add
+`.mcpscan/` to your `.gitignore`.
+
+Paths are reported relative to the repository root, found by walking up for
+`.git`, so a scan run from a package subdirectory still names the file where it
+is committed rather than where you happened to be standing.
+
+[`.github/workflows/mcpscan.yml`](.github/workflows/mcpscan.yml) runs a static
+scan of this repository's own deliberately vulnerable fixtures on every push and
+pull request, and uploads the result. It tolerates exit 1, because finding things
+in those fixtures is the expected outcome; a workflow scanning a server you
+maintain wants `test $code -eq 0` instead.
 
 ## Isolation model
 
@@ -155,8 +210,8 @@ one-time acknowledgement before its first run.
 - [x] YAML rule engine, JSON report
 - [x] Dynamic prober: rug pull, scope escape, env leakage
 - [x] `.mcpscan.lock` and `mcpscan verify`
+- [x] SARIF output for CI
 - [ ] Streamable HTTP transport (`--url`)
-- [ ] SARIF output for CI
 - [ ] HTML report
 
 ## Licence

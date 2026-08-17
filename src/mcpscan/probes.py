@@ -28,6 +28,7 @@ from enum import StrEnum
 from typing import Any, Final
 
 from mcpscan.canary import CanaryHit, Origin
+from mcpscan.document import pointer
 from mcpscan.engine import RuleMeta
 from mcpscan.models import Confidence, Finding, Location, Severity
 
@@ -35,6 +36,15 @@ RUG_PULL = RuleMeta(
     id="MCP-007",
     title="Tool definition changed after inspection",
     severity=Severity.HIGH,
+    description=(
+        "A server whose tool list is not the same on the second look as it was "
+        "on the first. mcpscan hashes every tool by the fields that steer a "
+        "model -- title, description, schemas, annotations -- then re-lists "
+        "under several conditions and diffs: after a tool has been called, "
+        "after time has passed, and while presenting a different client "
+        "identity. Concealment raises confidence, because a server that mutates "
+        "silently is doing something a server that announces a change is not."
+    ),
     remediation=(
         "Pin the server to a known version and check it with `mcpscan verify` on "
         "every build. A tool list that changes after approval means the "
@@ -47,6 +57,14 @@ SCOPE_ESCAPE = RuleMeta(
     id="MCP-008",
     title="Tool read outside its declared scope",
     severity=Severity.CRITICAL,
+    description=(
+        "A tool called with a traversal argument that returned the contents of "
+        "a decoy file planted outside the directory it is documented to serve. "
+        "Detection is an exact match on a token generated seconds earlier and "
+        "written nowhere the tool was entitled to read, so there is no benign "
+        "explanation for it appearing in the response and no corpus of false "
+        "positives behind the rule."
+    ),
     remediation=(
         "Resolve and constrain every caller-supplied path before opening it: "
         "reject traversal, resolve symlinks, and check the result is still inside "
@@ -59,6 +77,15 @@ ENV_LEAK = RuleMeta(
     id="MCP-009",
     title="Environment secret disclosed in a server response",
     severity=Severity.HIGH,
+    description=(
+        "A value from the server's environment coming back in a tool result, a "
+        "resource, a prompt or an error message. Every environment value is a "
+        "canary generated for this scan and injected only into the target's "
+        "process, so a match cannot have arrived any other way. Severity rises "
+        "when the variable was never declared: echoing a variable the server "
+        "asked for is careless, echoing one it never mentioned means it went "
+        "looking."
+    ),
     remediation=(
         "Never echo environment variables into tool output, structured content or "
         "error messages. A value that reaches a response reaches the model's "
@@ -143,23 +170,46 @@ class ToolDrift:
     kind: DriftKind
     #: Which probe condition surfaced it, e.g. "after calling a tool".
     condition: str
+    #: The value of the field this drift is *about*, before and after. Which
+    #: field that is depends on `fields`; the location says so out loud.
     before: str | None = None
     after: str | None = None
-    #: Index in the later listing, when the tool is in it.
-    index: int | None = None
+    #: Index in the **baseline** listing -- the one the report's survey artefact
+    #: is written from. `None` for a tool that only exists in the later listing,
+    #: which is nowhere in the baseline to point at. Not the later index: a
+    #: server free to reorder its tools is exactly the server this rule is for.
+    baseline_index: int | None = None
     #: The identity presented, when this was a client-targeted difference.
     client_name: str | None = None
+    #: Which of `client.SALIENT_KEYS` differ. Empty for a tool that appeared or
+    #: vanished, where the whole definition is the change.
+    fields: tuple[str, ...] = ()
+
+
+def _drift_location(drift: ToolDrift) -> Location:
+    """The most specific place in the baseline that this drift is about.
+
+    A rug pull is a change to a *field*, and the drift knows which one whenever
+    exactly one changed -- so the finding says `#/tools/3/description` rather
+    than `#/tools/3`, and a report can underline the text that is no longer in
+    force instead of the brace above it. Two fields changing at once has no
+    single location, and the tool object is then the honest answer; `fields`
+    still names them.
+    """
+    if drift.baseline_index is None:
+        return Location(pointer=f"#/_probe/rug-pull/{drift.tool}")
+    if len(drift.fields) == 1:
+        return Location(pointer=pointer("tools", drift.baseline_index, drift.fields[0]))
+    return Location(pointer=pointer("tools", drift.baseline_index))
 
 
 def rug_pull_finding(drift: ToolDrift, *, subject: str = "") -> Finding:
     rank = DRIFT_RANKS[drift.kind]
-    where = (
-        Location(pointer=f"#/tools/{drift.index}")
-        if drift.index is not None
-        else Location(pointer=f"#/_probe/rug-pull/{drift.tool}")
-    )
+    where = _drift_location(drift)
 
     detail = f"Tool {drift.tool!r} {rank.summary}"
+    if drift.fields:
+        detail += f" Changed: {', '.join(drift.fields)}."
     if drift.client_name:
         detail += f" Identity presented: {drift.client_name!r}."
 
@@ -169,6 +219,8 @@ def rug_pull_finding(drift: ToolDrift, *, subject: str = "") -> Finding:
         "tool": drift.tool,
         "condition": drift.condition,
     }
+    if drift.fields:
+        metadata["fields"] = list(drift.fields)
     if drift.client_name:
         metadata["client_name"] = drift.client_name
 

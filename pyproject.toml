@@ -42,6 +42,11 @@ source-include = ["src/mcpscan/rules/*.yaml"]
 
 [dependency-groups]
 dev = [
+    # Validates every SARIF document the exporter produces against the vendored
+    # OASIS 2.1.0 schema. Dev only: nothing in `src/` imports it, and a scanner
+    # that needed a validator at runtime to emit valid output would be admitting
+    # it does not know what it is emitting.
+    "jsonschema>=4.26.0",
     "mypy>=2.3.0",
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",

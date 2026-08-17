@@ -26,12 +26,13 @@ servers worth scanning: the ones assembling descriptions at runtime.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator, Mapping
+import json
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Final
 
-from mcpscan.models import Location
+from mcpscan.models import Location, Span
 
 #: Nested schemas are walked, but a hostile server can nest forever. This is the
 #: same argument as `jsonrpc.MAX_DEPTH`, applied to a structure we already parsed.
@@ -366,3 +367,328 @@ def _walk_schema(
                     yield from _walk_schema(
                         value, f"{prefix}/{container}/{sub_index}", locations, depth + 1
                     )
+
+
+# ---------------------------------------------------------------------------
+# The survey artefact
+#
+# A live server has no file. Its findings carry a JSON pointer and nothing else,
+# and a SARIF result with no `physicalLocation` is silently dropped by GitHub --
+# so a scan of a server that failed nine ways would upload as a clean run. The
+# fix is to give those findings a file: serialise the document the rules walked,
+# and record where every value landed in it.
+#
+# Written here rather than in `sarif.py` on purpose. The artefact's addresses and
+# the rules' addresses are the same JSON pointers, and the two only stay in
+# agreement if the code that builds them sits next to `walk_text`. A serialiser
+# in another module would drift the first time a field was added to the walk.
+#
+# Note for whoever adds a second consumer: `prober.localise` mounts the working
+# directory read-only into the container, so a previous scan's artefact is
+# readable by the next target. Nothing secret is in one -- canaries are redacted
+# and the content is what the server itself served -- but an evasive server can
+# use it to learn that it is being scanned and what was seen last time.
+# ---------------------------------------------------------------------------
+
+#: A hostile server chooses how long its descriptions are. It does not get to
+#: choose how large our artefact is -- the same argument as `RAW_SAMPLE_BYTES`
+#: and `EVIDENCE_CHARS`, one layer out.
+MAX_ARTEFACT_VALUE_CHARS: Final = 4096
+
+#: Deeper than `walk_text` will ever look (`MAX_SCHEMA_DEPTH`), shallow enough
+#: not to exhaust the stack. The live path is already bounded by
+#: `jsonrpc.MAX_DEPTH`; a source tree's `ast.literal_eval` output is not.
+MAX_ARTEFACT_DEPTH: Final = 64
+
+TRUNCATED = "…[mcpscan: truncated]"
+
+
+def _escaped(text: str) -> str:
+    """The characters JSON would write between the quotes.
+
+    ``ensure_ascii=True`` throughout, and not for looks. It is what makes a lone
+    surrogate -- which ``json.loads`` accepts from the wire and UTF-8 cannot
+    encode -- survive as ``\\ud800`` instead of crashing the writer. It also
+    makes the artefact pure ASCII, so a character, a UTF-16 code unit and a byte
+    are the same thing and a SARIF column is just an offset.
+    """
+    return json.dumps(text, ensure_ascii=True)[1:-1]
+
+
+@dataclass(frozen=True, slots=True)
+class Anchor:
+    """Where one value from the document landed in the serialised artefact.
+
+    ``line`` and ``column`` are 1-based and point at the value's first character
+    -- the opening quote, for a string. ``text`` is the value *before* redaction
+    and truncation, because that is what a finding's :class:`~mcpscan.models.Span`
+    indexes; ``exact`` and ``limit`` record whether that indexing still survives
+    the trip through the writer.
+    """
+
+    line: int
+    column: int
+    #: The original string, when this anchor is on one. ``None`` for containers.
+    text: str | None = None
+    #: False when redaction rewrote the value, so offsets into ``text`` no longer
+    #: line up with what was written. A line is still exact; columns are not.
+    exact: bool = True
+    #: How many characters were actually written, when the value was capped.
+    limit: int | None = None
+    #: Width of the value as written, between the quotes. Measured rather than
+    #: derived, so it survives redaction and truncation -- which is what lets
+    #: :meth:`whole` answer for a value :meth:`columns` cannot.
+    width: int | None = None
+
+    def columns(self, span: Span) -> tuple[int, int] | None:
+        """SARIF ``startColumn``/``endColumn`` for a span within this value.
+
+        ``None`` when the artefact cannot honestly place it: a redacted value, a
+        span past the cap, or an anchor on a container rather than a string.
+        Reporting the line alone is the right answer there -- an invented column
+        points a reader at the wrong characters and looks authoritative doing it.
+        """
+        if not self.exact or self.text is None:
+            return None
+        if self.limit is not None and span.end > self.limit:
+            return None
+        if span.end > len(self.text):
+            return None
+        opening = self.column + 1
+        return (
+            opening + len(_escaped(self.text[: span.start])),
+            opening + len(_escaped(self.text[: span.end])),
+        )
+
+    def whole(self) -> tuple[int, int] | None:
+        """Columns spanning the entire value, for a finding with no span.
+
+        A pattern rule matched a substring and says where. A probe did not: a
+        rug pull is a statement about a whole field, and MCP-009 is a statement
+        about a whole `instructions` block. Those still deserve columns -- the
+        alternative is a region that starts at the line and ends nowhere, which
+        renders as the whole line including the key and the punctuation.
+
+        Measured from what was written, so unlike :meth:`columns` this survives a
+        redacted or truncated value: the width is real even when the offsets a
+        span would use are not.
+        """
+        if self.width is None:
+            return None
+        return (self.column + 1, self.column + 1 + self.width)
+
+
+@dataclass(frozen=True, slots=True)
+class SurveyArtefact:
+    """A serialised :class:`MetadataDocument` and a map back into it."""
+
+    text: str
+    anchors: dict[str, Anchor]
+    #: Tool name -> index, for the *unique* names only. Two tools called
+    #: ``search`` are two tools; a name that does not identify one is not an
+    #: identity, and a fingerprint built on it would merge them.
+    tool_index: dict[str, int] = field(default_factory=dict)
+
+    def anchor_for(self, target: str) -> Anchor:
+        """The best place in the artefact for a pointer, never nothing.
+
+        Four steps, in order. An exact hit. Then a probe pointer -- ``probes.py``
+        writes ``#/_probe/rug-pull/<tool>`` when a tool has no index in the later
+        listing -- resolved by name back to the tool it is about. Then the
+        longest prefix that does exist, so a nested schema field lands on its
+        tool rather than nowhere. Then the root.
+
+        The chain bottoms out at line 1 rather than at ``None`` deliberately:
+        ``#/_transport/7`` names an arrival order, not a place in the metadata,
+        and a result that GitHub drops is a finding nobody is told about.
+        """
+        anchor = self.anchors.get(target)
+        if anchor is not None:
+            return anchor
+
+        # Split on the first two segments only. Probe pointers interpolate the
+        # tool name without RFC 6901 escaping, so a tool called `read/file`
+        # arrives here as four segments and the name is everything after the
+        # second.
+        if target.startswith("#/_probe/"):
+            parts = target.split("/", 3)
+            if len(parts) == 4:
+                index = self.tool_index.get(parts[3])
+                if index is not None:
+                    anchor = self.anchors.get(pointer("tools", index))
+                    if anchor is not None:
+                        return anchor
+
+        prefix = target
+        while "/" in prefix:
+            prefix = prefix.rsplit("/", 1)[0]
+            anchor = self.anchors.get(prefix)
+            if anchor is not None:
+                return anchor
+
+        return self.anchors.get("#", Anchor(line=1, column=1))
+
+
+class _Writer:
+    """Appends ASCII and remembers where it is. Nothing else."""
+
+    __slots__ = ("anchors", "column", "line", "parts")
+
+    def __init__(self) -> None:
+        self.parts: list[str] = []
+        self.line = 1
+        self.column = 1
+        self.anchors: dict[str, Anchor] = {}
+
+    def raw(self, text: str) -> None:
+        """Write text that contains no newline. Everything here is ASCII."""
+        self.parts.append(text)
+        self.column += len(text)
+
+    def newline(self, indent: int) -> None:
+        self.parts.append("\n" + "  " * indent)
+        self.line += 1
+        self.column = 2 * indent + 1
+
+
+def _emit_string(
+    writer: _Writer, value: str, ptr: str, redact: Callable[[str], str] | None
+) -> None:
+    shown = redact(value) if redact is not None else value
+    exact = shown == value
+    limit: int | None = None
+    if len(shown) > MAX_ARTEFACT_VALUE_CHARS:
+        limit = MAX_ARTEFACT_VALUE_CHARS
+        shown = shown[:MAX_ARTEFACT_VALUE_CHARS] + TRUNCATED
+    writer.anchors[ptr] = Anchor(
+        line=writer.line,
+        column=writer.column,
+        text=value,
+        exact=exact,
+        limit=limit,
+        width=len(_escaped(shown)),
+    )
+    writer.raw(json.dumps(shown, ensure_ascii=True))
+
+
+def _emit(
+    writer: _Writer,
+    value: object,
+    ptr: str,
+    indent: int,
+    depth: int,
+    redact: Callable[[str], str] | None,
+) -> None:
+    if isinstance(value, str):
+        _emit_string(writer, value, ptr, redact)
+        return
+
+    writer.anchors[ptr] = Anchor(line=writer.line, column=writer.column)
+
+    if depth > MAX_ARTEFACT_DEPTH:
+        writer.raw(json.dumps(TRUNCATED, ensure_ascii=True))
+        return
+
+    if isinstance(value, Mapping):
+        items = list(value.items())
+        if not items:
+            writer.raw("{}")
+            return
+        writer.raw("{")
+        for position, (key, sub) in enumerate(items):
+            name = str(key)
+            writer.newline(indent + 1)
+            writer.raw(json.dumps(name, ensure_ascii=True) + ": ")
+            _emit(writer, sub, f"{ptr}/{escape_token(name)}", indent + 1, depth + 1, redact)
+            if position < len(items) - 1:
+                writer.raw(",")
+        writer.newline(indent)
+        writer.raw("}")
+        return
+
+    if isinstance(value, (list, tuple)):
+        entries = list(value)
+        if not entries:
+            writer.raw("[]")
+            return
+        writer.raw("[")
+        for index, sub in enumerate(entries):
+            writer.newline(indent + 1)
+            _emit(writer, sub, f"{ptr}/{index}", indent + 1, depth + 1, redact)
+            if index < len(entries) - 1:
+                writer.raw(",")
+        writer.newline(indent)
+        writer.raw("]")
+        return
+
+    try:
+        # `allow_nan=False` because `json.loads` accepts `Infinity` and `NaN` by
+        # default and `json.dumps` will happily write them back out, producing a
+        # file no strict parser -- including the one validating the SARIF that
+        # points at it -- will read.
+        writer.raw(json.dumps(value, ensure_ascii=True, allow_nan=False))
+    except (ValueError, TypeError):
+        writer.raw("null")
+
+
+#: The artefact's top-level keys are the *pointer* tokens, not the dataclass
+#: attribute names. `walk_text` emits `#/serverInfo/name` and
+#: `#/resourceTemplates/0/uriTemplate`; `MetadataDocument` spells those fields
+#: `server_info` and `resource_templates`. Serialise the attribute names and
+#: every finding on either falls back to line 1 -- invisibly, because the
+#: fallback is designed to be invisible.
+_ROOT_KEYS: Final = ("instructions", "serverInfo", "tools", "resources", "resourceTemplates",
+                     "prompts")
+
+
+def serialise(
+    doc: MetadataDocument, *, redact: Callable[[str], str] | None = None
+) -> SurveyArtefact:
+    """Write the document out, recording where every value went.
+
+    Deterministic: no clock, no ordering that depends on a set, and the same
+    document twice produces the same bytes. That is what makes the artefact
+    diffable -- it changes when the server changes and not otherwise -- and it
+    is why ``redact`` exists, since a canary token is regenerated every scan and
+    would otherwise churn the file on every run.
+    """
+    payload: dict[str, object] = {
+        "instructions": doc.instructions,
+        "serverInfo": doc.server_info,
+        "tools": doc.tools,
+        "resources": doc.resources,
+        "resourceTemplates": doc.resource_templates,
+        "prompts": doc.prompts,
+    }
+
+    writer = _Writer()
+    writer.anchors["#"] = Anchor(line=1, column=1)
+    writer.raw("{")
+    for position, key in enumerate(_ROOT_KEYS):
+        writer.newline(1)
+        writer.raw(json.dumps(key, ensure_ascii=True) + ": ")
+        _emit(writer, payload[key], pointer(key), 1, 1, redact)
+        if position < len(_ROOT_KEYS) - 1:
+            writer.raw(",")
+    writer.newline(0)
+    writer.raw("}")
+
+    counts: dict[str, int] = {}
+    for tool in doc.tools:
+        if isinstance(tool, Mapping):
+            name = tool.get("name")
+            if isinstance(name, str):
+                counts[name] = counts.get(name, 0) + 1
+    index_by_name = {
+        name: index
+        for index, tool in enumerate(doc.tools)
+        if isinstance(tool, Mapping)
+        and isinstance(name := tool.get("name"), str)
+        and counts[name] == 1
+    }
+
+    return SurveyArtefact(
+        text="".join(writer.parts) + "\n",
+        anchors=writer.anchors,
+        tool_index=index_by_name,
+    )

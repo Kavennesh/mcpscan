@@ -8,3 +8,11 @@ dist/
 build/
 *.egg-info/
 reports/
+# Survey artefacts written by `--format sarif`. Per-run output, unlike
+# .mcpscan.lock, which is meant to be committed.
+.mcpscan/
+# Where .github/workflows/mcpscan.yml materialises the .py.txt fixtures to scan
+# them. Ignored so a local replay of that job cannot commit a tree full of
+# `os.system` into src/ or tests/, where test_containment.py would rightly fail.
+scan-target/
+mcpscan*.sarif
